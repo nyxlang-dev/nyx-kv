@@ -1,0 +1,453 @@
+// persist.nx — Binary .ndb persistence for nyx-kv
+//
+// Format:
+//   [HEADER]   5 bytes "NYXDB" + 1 byte version (0x01)
+//   [META]     8 bytes timestamp LE + 4 bytes num_keys LE
+//   [ENTRIES]  Per key:
+//                1 byte  type (0=string, 1=list, 2=set, 3=hash)
+//                8 bytes TTL unix timestamp (0 = no TTL)
+//                4 bytes key length + N bytes key
+//                VALUE (type-dependent, length-prefixed)
+//   [CHECKSUM] 4 bytes CRC32 of everything before
+//   [EOF]      1 byte 0xFF
+
+// ── Binary encoding helpers ──
+
+fn push_byte(arr: Array, val: int) {
+    arr.push(val & 255)
+}
+
+fn push_i32_le(arr: Array, val: int) {
+    arr.push(val & 255)
+    arr.push((val >> 8) & 255)
+    arr.push((val >> 16) & 255)
+    arr.push((val >> 24) & 255)
+}
+
+fn push_i64_le(arr: Array, val: int) {
+    arr.push(val & 255)
+    arr.push((val >> 8) & 255)
+    arr.push((val >> 16) & 255)
+    arr.push((val >> 24) & 255)
+    arr.push((val >> 32) & 255)
+    arr.push((val >> 40) & 255)
+    arr.push((val >> 48) & 255)
+    arr.push((val >> 56) & 255)
+}
+
+fn push_string(arr: Array, s: String) {
+    let slen: int = str_byte_length(s)
+    push_i32_le(arr, slen)
+    var i: int = 0
+    while i < slen {
+        arr.push(s.charAt(i))
+        i = i + 1
+    }
+}
+
+// ── Binary decoding helpers ──
+
+fn read_byte(arr: Array, offset: int) -> int {
+    let b: int = arr[offset]
+    return b & 255
+}
+
+fn read_i32_le(arr: Array, offset: int) -> int {
+    let b0: int = arr[offset] & 255
+    let b1: int = arr[offset + 1] & 255
+    let b2: int = arr[offset + 2] & 255
+    let b3: int = arr[offset + 3] & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn read_i64_le(arr: Array, offset: int) -> int {
+    let b0: int = arr[offset] & 255
+    let b1: int = arr[offset + 1] & 255
+    let b2: int = arr[offset + 2] & 255
+    let b3: int = arr[offset + 3] & 255
+    let b4: int = arr[offset + 4] & 255
+    let b5: int = arr[offset + 5] & 255
+    let b6: int = arr[offset + 6] & 255
+    let b7: int = arr[offset + 7] & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+}
+
+fn read_string(arr: Array, offset: int) -> Array {
+    let slen: int = read_i32_le(arr, offset)
+    let s: String = string_from_bytes(arr, offset + 4, slen)
+    let new_offset: int = offset + 4 + slen
+    return [s, new_offset]
+}
+
+// ── Serialize ──
+
+pub fn kv_save(path: String) -> int {
+    let buf: Array = []
+    var saved: int = 0
+    let now_us: int = time_us()
+    let now_sec: int = now_us / 1000000
+
+    // Count total keys (including auth tokens as type 4)
+    let total: int = g_store.size() + g_lists.size() + g_sets.size() + g_hashes.size() + auth_token_count()
+
+    // HEADER: "NYXDB" + version 0x01
+    push_byte(buf, 78)   // N
+    push_byte(buf, 89)   // Y
+    push_byte(buf, 88)   // X
+    push_byte(buf, 68)   // D
+    push_byte(buf, 66)   // B
+    push_byte(buf, 1)    // version
+
+    // META: 8-byte timestamp + 4-byte key count
+    push_i64_le(buf, now_sec)
+    push_i32_le(buf, total)
+
+    // ── String entries (type 0) ──
+    let skeys: Array = g_store.keys()
+    var i: int = 0
+    while i < skeys.length() {
+        let key: String = skeys[i]
+        let val: String = g_store.get(key)
+        let ttl_ts: int = kv_ttl_timestamp(key, now_us)
+        push_byte(buf, 0)
+        push_i64_le(buf, ttl_ts)
+        push_string(buf, key)
+        push_string(buf, val)
+        saved = saved + 1
+        i = i + 1
+    }
+
+    // ── List entries (type 1) ──
+    let lkeys: Array = g_lists.keys()
+    i = 0
+    while i < lkeys.length() {
+        let key: String = lkeys[i]
+        let arr: Array = g_lists.get(key)
+        let ttl_ts: int = kv_ttl_timestamp(key, now_us)
+        push_byte(buf, 1)
+        push_i64_le(buf, ttl_ts)
+        push_string(buf, key)
+        // List count + items in logical order (internal is reversed)
+        let count: int = arr.length()
+        push_i32_le(buf, count)
+        var j: int = count - 1
+        while j >= 0 {
+            let elem: String = arr[j]
+            push_string(buf, elem)
+            j = j - 1
+        }
+        saved = saved + 1
+        i = i + 1
+    }
+
+    // ── Set entries (type 2) ──
+    let tkeys: Array = g_sets.keys()
+    i = 0
+    while i < tkeys.length() {
+        let key: String = tkeys[i]
+        let ttl_ts: int = kv_ttl_timestamp(key, now_us)
+        push_byte(buf, 2)
+        push_i64_le(buf, ttl_ts)
+        push_string(buf, key)
+        // Collect members
+        let members: Array = kv_smembers(key)
+        push_i32_le(buf, members.length())
+        var mi: int = 0
+        while mi < members.length() {
+            let m: String = members[mi]
+            push_string(buf, m)
+            mi = mi + 1
+        }
+        saved = saved + 1
+        i = i + 1
+    }
+
+    // ── Hash entries (type 3) ──
+    let hkeys: Array = g_hashes.keys()
+    i = 0
+    while i < hkeys.length() {
+        let key: String = hkeys[i]
+        let ttl_ts: int = kv_ttl_timestamp(key, now_us)
+        push_byte(buf, 3)
+        push_i64_le(buf, ttl_ts)
+        push_string(buf, key)
+        // Collect field/value pairs
+        let pairs: Array = kv_hgetall(key)
+        let pair_count: int = pairs.length() / 2
+        push_i32_le(buf, pair_count)
+        var pi: int = 0
+        while pi < pairs.length() {
+            let field: String = pairs[pi]
+            let val: String = pairs[pi + 1]
+            push_string(buf, field)
+            push_string(buf, val)
+            pi = pi + 2
+        }
+        saved = saved + 1
+        i = i + 1
+    }
+
+    // ── Auth token entries (type 4) ──
+    let token_pairs: Array = auth_get_all_tokens()
+    var ti: int = 0
+    while ti < token_pairs.length() {
+        let token: String = token_pairs[ti]
+        let info: String = token_pairs[ti + 1]
+        push_byte(buf, 4)
+        push_i64_le(buf, 0)
+        push_string(buf, token)
+        push_string(buf, info)
+        saved = saved + 1
+        ti = ti + 2
+    }
+
+    // CHECKSUM: CRC32 of everything so far
+    let crc: int = crc32_bytes(buf)
+    push_i32_le(buf, crc)
+
+    // EOF marker
+    push_byte(buf, 255)
+
+    // Atomic write: write to .tmp, then rename
+    let tmp_path: String = path + ".tmp"
+    let f: Map = file_open(tmp_path, "wb")
+    file_write_bytes(f, buf)
+    file_flush(f)
+    file_close(f)
+    rename_file(tmp_path, path)
+
+    g_changes_since_save = 0
+    g_last_save_time = time_us()
+    return saved
+}
+
+// Get absolute TTL timestamp in seconds (0 = no TTL)
+fn kv_ttl_timestamp(key: String, now_us: int) -> int {
+    if g_ttl.contains(key) == false { return 0 }
+    let exp_us: int = g_ttl.get(key)
+    if exp_us <= 0 { return 0 }
+    if exp_us <= now_us { return 0 }
+    return exp_us / 1000000
+}
+
+// ── Deserialize ──
+
+pub fn kv_load(path: String) -> int {
+    // Read entire file as byte array
+    let f: Map = file_open(path, "rb")
+    file_seek(f, 0, 2)
+    let file_size: int = file_tell(f)
+    file_seek(f, 0, 0)
+    let buf: Array = file_read_bytes(f, file_size)
+    file_close(f)
+
+    if buf.length() < 18 {
+        print("[persist] ERROR: dump.ndb too small (" + int_to_string(buf.length()) + " bytes)")
+        return 0
+    }
+
+    // Validate HEADER
+    if buf[0] != 78 or buf[1] != 89 or buf[2] != 88 or buf[3] != 68 or buf[4] != 66 {
+        print("[persist] ERROR: invalid magic (not NYXDB)")
+        return 0
+    }
+    let version: int = buf[5]
+    if version != 1 {
+        print("[persist] ERROR: unsupported version " + int_to_string(version))
+        return 0
+    }
+
+    // Verify checksum: CRC32 of everything except last 5 bytes (4 CRC + 1 EOF)
+    let data_len: int = buf.length() - 5
+    // Build sub-array for CRC (just slice the original)
+    let stored_crc: int = read_i32_le(buf, data_len)
+    // Compute CRC over buf[0..data_len]
+    // We need a sub-array. Use slice.
+    let data_buf: Array = buf.slice(0, data_len)
+    let computed_crc: int = crc32_bytes(data_buf)
+    if stored_crc != computed_crc {
+        print("[persist] ERROR: CRC32 mismatch (file corrupted)")
+        print("  stored:   " + int_to_string(stored_crc))
+        print("  computed: " + int_to_string(computed_crc))
+        return 0
+    }
+
+    // Verify EOF marker
+    let eof_byte: int = buf[buf.length() - 1]
+    if eof_byte != 255 {
+        print("[persist] ERROR: missing EOF marker")
+        return 0
+    }
+
+    // META
+    let timestamp: int = read_i64_le(buf, 6)
+    let num_keys: int = read_i32_le(buf, 14)
+    let now_us: int = time_us()
+    let now_sec: int = now_us / 1000000
+
+    var offset: int = 18
+    var loaded: int = 0
+
+    var ki: int = 0
+    while ki < num_keys and offset < data_len {
+        let entry_type: int = read_byte(buf, offset)
+        offset = offset + 1
+
+        let ttl_ts: int = read_i64_le(buf, offset)
+        offset = offset + 8
+
+        // Read key
+        let key_result: Array = read_string(buf, offset)
+        let key: String = key_result[0]
+        offset = key_result[1]
+
+        // Skip expired keys (auth tokens type 4 never expire)
+        if ttl_ts > 0 and ttl_ts <= now_sec and entry_type != 4 {
+            // Key has expired — skip its value
+            if entry_type == 0 {
+                let skip_len: int = read_i32_le(buf, offset)
+                offset = offset + 4 + skip_len
+            }
+            if entry_type == 1 or entry_type == 2 {
+                let skip_count: int = read_i32_le(buf, offset)
+                offset = offset + 4
+                var si: int = 0
+                while si < skip_count {
+                    let sl: int = read_i32_le(buf, offset)
+                    offset = offset + 4 + sl
+                    si = si + 1
+                }
+            }
+            if entry_type == 3 {
+                let skip_count: int = read_i32_le(buf, offset)
+                offset = offset + 4
+                var si: int = 0
+                while si < skip_count {
+                    let kl: int = read_i32_le(buf, offset)
+                    offset = offset + 4 + kl
+                    let vl: int = read_i32_le(buf, offset)
+                    offset = offset + 4 + vl
+                    si = si + 1
+                }
+            }
+            ki = ki + 1
+            // don't increment loaded — this key was expired
+        } else {
+            // Restore TTL if set
+            var ttl_remaining: int = 0
+            if ttl_ts > 0 {
+                ttl_remaining = ttl_ts - now_sec
+                if ttl_remaining <= 0 { ttl_remaining = 1 }
+            }
+
+            if entry_type == 0 {
+                // String
+                let val_result: Array = read_string(buf, offset)
+                let val: String = val_result[0]
+                offset = val_result[1]
+                g_store.insert(key, val)
+                if ttl_remaining > 0 { kv_expire(key, ttl_remaining) }
+                loaded = loaded + 1
+            }
+
+            if entry_type == 1 {
+                // List
+                let count: int = read_i32_le(buf, offset)
+                offset = offset + 4
+                let items: Array = []
+                var li: int = 0
+                while li < count {
+                    let item_result: Array = read_string(buf, offset)
+                    let item: String = item_result[0]
+                    offset = item_result[1]
+                    items.push(item)
+                    li = li + 1
+                }
+                // Reverse to internal storage order
+                items.reverse()
+                g_lists.insert(key, items)
+                if ttl_remaining > 0 { kv_expire(key, ttl_remaining) }
+                loaded = loaded + 1
+            }
+
+            if entry_type == 2 {
+                // Set
+                let count: int = read_i32_le(buf, offset)
+                offset = offset + 4
+                var mcount: int = 0
+                var si: int = 0
+                while si < count {
+                    let mem_result: Array = read_string(buf, offset)
+                    let member: String = mem_result[0]
+                    offset = mem_result[1]
+                    let flat_key: String = key + "::" + member
+                    g_set_members.insert(flat_key, 1)
+                    mcount = mcount + 1
+                    si = si + 1
+                }
+                if mcount > 0 { g_sets.insert(key, mcount) }
+                if ttl_remaining > 0 { kv_expire(key, ttl_remaining) }
+                loaded = loaded + 1
+            }
+
+            if entry_type == 3 {
+                // Hash
+                let count: int = read_i32_le(buf, offset)
+                offset = offset + 4
+                var fcount: int = 0
+                var hi: int = 0
+                while hi < count {
+                    let field_result: Array = read_string(buf, offset)
+                    let field: String = field_result[0]
+                    offset = field_result[1]
+                    let val_result: Array = read_string(buf, offset)
+                    let hval: String = val_result[0]
+                    offset = val_result[1]
+                    let flat_key: String = key + "::" + field
+                    g_hash_fields.insert(flat_key, hval)
+                    fcount = fcount + 1
+                    hi = hi + 1
+                }
+                if fcount > 0 { g_hashes.insert(key, fcount) }
+                if ttl_remaining > 0 { kv_expire(key, ttl_remaining) }
+                loaded = loaded + 1
+            }
+
+            if entry_type == 4 {
+                // Auth token: key=token, value=info (user_id:plan)
+                let val_result: Array = read_string(buf, offset)
+                let info: String = val_result[0]
+                offset = val_result[1]
+                auth_restore_token(key, info)
+                loaded = loaded + 1
+            }
+
+            ki = ki + 1
+        }
+    }
+
+    g_last_save_time = time_us()
+    g_changes_since_save = 0
+    return loaded
+}
+
+// Background saver thread function.
+//
+// Wakes every second. If there is any pending change, persists immediately.
+// Earlier this was 10s + (>=100 changes or >=60s elapsed) which meant a
+// fresh signup could be lost forever if the daemon restarted before either
+// threshold tripped. The shutdown signal handler is supposed to flush on
+// SIGTERM but it runs GC_MALLOC + file I/O inside the signal handler —
+// neither is async-signal-safe — and silently corrupts/aborts on restart.
+// Persisting every 1s caps the loss window at ~1s per change with
+// negligible I/O cost for the small datasets this KV typically holds.
+pub fn kv_bg_saver() -> int {
+    while 1 > 0 {
+        sleep(1000)
+        if g_changes_since_save > 0 {
+            let saved: int = kv_save(g_save_path)
+            print("[bg-save] saved " + int_to_string(saved) + " keys to " + g_save_path)
+        }
+    }
+    return 0
+}

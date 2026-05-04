@@ -1,0 +1,178 @@
+// pubsub.nx — Pub/Sub for nyx-kv
+// SUBSCRIBE channel: enter subscriber mode, receive messages
+// PUBLISH channel message: send to all subscribers, return count
+// UNSUBSCRIBE channel: leave subscriber mode
+
+// Global state: channel_name → Array of subscriber fds
+var g_pubsub_channels: Map = map_new()
+var g_pubsub_mtx: Map = Map.new()
+var g_pubsub_init: int = 0
+
+fn pubsub_init() {
+    if g_pubsub_init == 1 { return 0 }
+    g_pubsub_mtx = mutex_new()
+    g_pubsub_init = 1
+    return 0
+}
+
+// Subscribe fd to a channel. Returns RESP subscribe confirmation.
+pub fn pubsub_subscribe(fd: int, channel_name: String) -> String {
+    pubsub_init()
+    mutex_lock(g_pubsub_mtx)
+
+    if g_pubsub_channels.contains(channel_name) == false {
+        let subs: Array = []
+        g_pubsub_channels.insert(channel_name, subs)
+    }
+    let subs: Array = g_pubsub_channels.get(channel_name)
+
+    // Check if already subscribed
+    var already: bool = false
+    var i: int = 0
+    while i < subs.length() {
+        let existing: int = subs[i]
+        if existing == fd { already = true }
+        i = i + 1
+    }
+    if already == false {
+        subs.push(fd)
+    }
+
+    mutex_unlock(g_pubsub_mtx)
+
+    // Send subscribe confirmation: *3\r\n$9\r\nsubscribe\r\n$N\r\nchannel\r\n:1\r\n
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append("*3\r\n$9\r\nsubscribe\r\n$")
+    sb.append(int_to_string(channel_name.length()))
+    sb.append("\r\n")
+    sb.append(channel_name)
+    sb.append("\r\n:1\r\n")
+    return sb.to_string()
+}
+
+// Unsubscribe fd from a channel. Returns RESP unsubscribe confirmation.
+pub fn pubsub_unsubscribe(fd: int, channel_name: String) -> String {
+    pubsub_init()
+    mutex_lock(g_pubsub_mtx)
+
+    if g_pubsub_channels.contains(channel_name) {
+        let subs: Array = g_pubsub_channels.get(channel_name)
+        let new_subs: Array = []
+        var i: int = 0
+        while i < subs.length() {
+            let s: int = subs[i]
+            if s != fd { new_subs.push(s) }
+            i = i + 1
+        }
+        g_pubsub_channels.insert(channel_name, new_subs)
+    }
+
+    mutex_unlock(g_pubsub_mtx)
+
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append("*3\r\n$11\r\nunsubscribe\r\n$")
+    sb.append(int_to_string(channel_name.length()))
+    sb.append("\r\n")
+    sb.append(channel_name)
+    sb.append("\r\n:0\r\n")
+    return sb.to_string()
+}
+
+// Unsubscribe fd from ALL channels (called on disconnect)
+pub fn pubsub_disconnect(fd: int) {
+    pubsub_init()
+    mutex_lock(g_pubsub_mtx)
+
+    let channels: Array = g_pubsub_channels.keys()
+    var ci: int = 0
+    while ci < channels.length() {
+        let ch: String = channels[ci]
+        let subs: Array = g_pubsub_channels.get(ch)
+        let new_subs: Array = []
+        var i: int = 0
+        while i < subs.length() {
+            let s: int = subs[i]
+            if s != fd { new_subs.push(s) }
+            i = i + 1
+        }
+        g_pubsub_channels.insert(ch, new_subs)
+        ci = ci + 1
+    }
+
+    mutex_unlock(g_pubsub_mtx)
+}
+
+// Publish a message to a channel. Returns number of subscribers who received it.
+pub fn pubsub_publish(channel_name: String, message: String) -> int {
+    pubsub_init()
+    mutex_lock(g_pubsub_mtx)
+
+    if g_pubsub_channels.contains(channel_name) == false {
+        mutex_unlock(g_pubsub_mtx)
+        return 0
+    }
+
+    let subs: Array = g_pubsub_channels.get(channel_name)
+    let count: int = subs.length()
+
+    // Build RESP message: *3\r\n$7\r\nmessage\r\n$N\r\nchannel\r\n$M\r\npayload\r\n
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append("*3\r\n$7\r\nmessage\r\n$")
+    sb.append(int_to_string(channel_name.length()))
+    sb.append("\r\n")
+    sb.append(channel_name)
+    sb.append("\r\n$")
+    sb.append(int_to_string(message.length()))
+    sb.append("\r\n")
+    sb.append(message)
+    sb.append("\r\n")
+    let msg: String = sb.to_string()
+
+    // Send to all subscribers
+    var i: int = 0
+    while i < subs.length() {
+        let sub_fd: int = subs[i]
+        tcp_write(sub_fd, msg)
+        i = i + 1
+    }
+
+    mutex_unlock(g_pubsub_mtx)
+    return count
+}
+
+// Enter subscriber mode: block reading commands, only process SUBSCRIBE/UNSUBSCRIBE/PING
+// Returns when client disconnects or sends UNSUBSCRIBE (with no remaining subscriptions)
+pub fn pubsub_subscriber_loop(fd: int) {
+    while 1 > 0 {
+        let cmd: Array = resp_read_command_fast(fd)
+        if cmd.length() == 0 {
+            // Client disconnected
+            pubsub_disconnect(fd)
+            return 0
+        }
+
+        let raw: String = cmd[0]
+        let upper: String = raw.toUpper()
+
+        if upper == "SUBSCRIBE" {
+            if cmd.length() >= 2 {
+                let ch: String = cmd[1]
+                let resp: String = pubsub_subscribe(fd, ch)
+                tcp_write(fd, resp)
+            }
+        } else if upper == "UNSUBSCRIBE" {
+            if cmd.length() >= 2 {
+                let ch: String = cmd[1]
+                let resp: String = pubsub_unsubscribe(fd, ch)
+                tcp_write(fd, resp)
+            }
+            // Exit subscriber mode
+            return 0
+        } else if upper == "PING" {
+            tcp_write(fd, "+PONG\r\n")
+        } else {
+            tcp_write(fd, "-ERR only SUBSCRIBE, UNSUBSCRIBE and PING are allowed in subscriber mode\r\n")
+        }
+    }
+    return 0
+}

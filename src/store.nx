@@ -1,0 +1,694 @@
+// store.nx — In-memory key-value store with TTL support
+// Uses global Maps for data storage and expiration tracking
+
+// Global store: key -> value (all values stored as Strings)
+var g_store: Map = Map.new()
+
+// List store: key -> Array of Strings (stored as i64 pointers)
+var g_lists: Map = Map.new()
+
+// Set store: g_sets tracks key -> member_count (int)
+// g_set_members tracks "key::member" -> 1 (flat encoding, no nested Maps)
+var g_sets: Map = Map.new()
+var g_set_members: Map = Map.new()
+
+// Hash store: g_hashes tracks key -> field_count (int)
+// g_hash_fields tracks "key::field" -> value (String, flat encoding)
+var g_hashes: Map = Map.new()
+var g_hash_fields: Map = Map.new()
+
+// TTL map: key -> expiration time in microseconds (0 = no expiry)
+var g_ttl: Map = Map.new()
+
+// Stats
+var g_ops_total: int = 0
+var g_connections: int = 0
+
+// Persistence
+var g_changes_since_save: int = 0
+var g_last_save_time: int = 0
+var g_save_path: String = "dump.ndb"
+
+// Check if a key has expired and remove it if so
+fn kv_check_expired(key: String) -> bool {
+    if g_ttl.contains(key) {
+        let exp: int = g_ttl.get(key)
+        if exp > 0 {
+            let now: int = time_us()
+            if now >= exp {
+                g_store.remove(key)
+                g_lists.remove(key)
+                if g_sets.contains(key) {
+                    kv_set_cleanup(key)
+                    g_sets.remove(key)
+                }
+                if g_hashes.contains(key) {
+                    kv_hash_cleanup(key)
+                    g_hashes.remove(key)
+                }
+                g_ttl.remove(key)
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// SET key value — returns -1 if key holds a list (WRONGTYPE)
+fn kv_set(key: String, value: String) -> int {
+    if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_store.insert(key, value)
+    // Clear any existing TTL (Redis semantics: SET resets TTL)
+    if g_ttl.size() > 0 {
+        if g_ttl.contains(key) {
+            g_ttl.remove(key)
+        }
+    }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    return 1
+}
+
+// GET key -> value or "" (empty = not found)
+fn kv_get(key: String) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) {
+        let val: String = g_store.get(key)
+        return val
+    }
+    return ""
+}
+
+// Returns 1 if key exists, 0 if not
+fn kv_exists(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) { return 1 }
+    if g_lists.contains(key) { return 1 }
+    if g_sets.contains(key) { return 1 }
+    if g_hashes.contains(key) { return 1 }
+    return 0
+}
+
+// DEL key -> 1 if deleted, 0 if not found
+fn kv_del(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) {
+        g_store.remove(key)
+        if g_ttl.contains(key) { g_ttl.remove(key) }
+        g_changes_since_save = g_changes_since_save + 1
+        return 1
+    }
+    if g_lists.contains(key) {
+        g_lists.remove(key)
+        if g_ttl.contains(key) { g_ttl.remove(key) }
+        g_changes_since_save = g_changes_since_save + 1
+        return 1
+    }
+    if g_sets.contains(key) {
+        kv_set_cleanup(key)
+        g_sets.remove(key)
+        if g_ttl.contains(key) { g_ttl.remove(key) }
+        g_changes_since_save = g_changes_since_save + 1
+        return 1
+    }
+    if g_hashes.contains(key) {
+        kv_hash_cleanup(key)
+        g_hashes.remove(key)
+        if g_ttl.contains(key) { g_ttl.remove(key) }
+        g_changes_since_save = g_changes_since_save + 1
+        return 1
+    }
+    return 0
+}
+
+// EXPIRE key seconds -> 1 if set, 0 if key doesn't exist
+fn kv_expire(key: String, seconds: int) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) or g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) {
+        let exp: int = time_us() + seconds * 1000000
+        g_ttl.insert(key, exp)
+        return 1
+    }
+    return 0
+}
+
+// TTL key -> seconds remaining, -1 if no expiry, -2 if key doesn't exist
+fn kv_ttl(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) == false and g_lists.contains(key) == false and g_sets.contains(key) == false and g_hashes.contains(key) == false {
+        return 0 - 2
+    }
+    if g_ttl.contains(key) {
+        let exp: int = g_ttl.get(key)
+        if exp > 0 {
+            let now: int = time_us()
+            let remaining: int = (exp - now) / 1000000
+            if remaining < 0 {
+                return 0
+            }
+            return remaining
+        }
+    }
+    return 0 - 1
+}
+
+// PERSIST key -> 1 if TTL removed, 0 if key has no TTL or doesn't exist
+fn kv_persist(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) == false and g_lists.contains(key) == false and g_sets.contains(key) == false and g_hashes.contains(key) == false {
+        return 0
+    }
+    if g_ttl.contains(key) {
+        g_ttl.remove(key)
+        return 1
+    }
+    return 0
+}
+
+// INCR key -> new value (creates key with 0 if not exists)
+fn kv_incr(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    var val: int = 0
+    if g_store.contains(key) {
+        let s: String = g_store.get(key)
+        val = string_to_int(s)
+    }
+    val = val + 1
+    g_store.insert(key, int_to_string(val))
+    g_changes_since_save = g_changes_since_save + 1
+    return val
+}
+
+// DECR key -> new value (creates key with 0 if not exists)
+fn kv_decr(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    var val: int = 0
+    if g_store.contains(key) {
+        let s: String = g_store.get(key)
+        val = string_to_int(s)
+    }
+    val = val - 1
+    g_store.insert(key, int_to_string(val))
+    g_changes_since_save = g_changes_since_save + 1
+    return val
+}
+
+// KEYS * -> Array of all non-expired keys (strings + lists)
+fn kv_keys() -> Array {
+    g_ops_total = g_ops_total + 1
+    let result: Array = []
+    let str_keys: Array = g_store.keys()
+    for k: String in str_keys {
+        if kv_check_expired(k) == false {
+            result.push(k)
+        }
+    }
+    let list_keys: Array = g_lists.keys()
+    for k: String in list_keys {
+        if kv_check_expired(k) == false {
+            result.push(k)
+        }
+    }
+    let set_keys: Array = g_sets.keys()
+    for k: String in set_keys {
+        if kv_check_expired(k) == false {
+            result.push(k)
+        }
+    }
+    let hash_keys: Array = g_hashes.keys()
+    for k: String in hash_keys {
+        if kv_check_expired(k) == false {
+            result.push(k)
+        }
+    }
+    return result
+}
+
+// DBSIZE -> number of keys (after expiry check)
+fn kv_dbsize() -> int {
+    g_ops_total = g_ops_total + 1
+    return g_store.size() + g_lists.size() + g_sets.size() + g_hashes.size()
+}
+
+// FLUSHDB -> clear all data
+fn kv_flushdb() -> int {
+    g_store.clear()
+    g_lists.clear()
+    g_sets.clear()
+    g_set_members.clear()
+    g_hashes.clear()
+    g_hash_fields.clear()
+    g_ttl.clear()
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    return 1
+}
+
+// === List operations ===
+
+// TYPE key -> "string", "list", "set", "hash", or "none"
+fn kv_type(key: String) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) { return "string" }
+    if g_lists.contains(key) { return "list" }
+    if g_sets.contains(key) { return "set" }
+    if g_hashes.contains(key) { return "hash" }
+    return "none"
+}
+
+// Lists use reversed internal storage: most recent LPUSH at the end.
+// This makes LPUSH/LPOP O(1) via push/pop (no memmove, thread-safe).
+// RPUSH/RPOP are O(n) but rare in practice.
+
+// LPUSH key value -> new length, -1 if WRONGTYPE
+fn kv_lpush(key: String, value: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_lists.contains(key) {
+        let arr: Array = g_lists.get(key)
+        arr.push(value)
+        return arr.length()
+    }
+    let arr: Array = [value]
+    g_lists.insert(key, arr)
+    return 1
+}
+
+// RPUSH key value -> new length, -1 if WRONGTYPE
+fn kv_rpush(key: String, value: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_lists.contains(key) {
+        let old: Array = g_lists.get(key)
+        let new_arr: Array = [value]
+        var i: int = 0
+        while i < old.length() {
+            let elem: String = old[i]
+            new_arr.push(elem)
+            i = i + 1
+        }
+        g_lists.insert(key, new_arr)
+        return new_arr.length()
+    }
+    let arr: Array = [value]
+    g_lists.insert(key, arr)
+    return 1
+}
+
+// LPOP key -> first element or "" if empty/missing
+fn kv_lpop(key: String) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_lists.contains(key) == false { return "" }
+    let arr: Array = g_lists.get(key)
+    if arr.length() == 0 { return "" }
+    let last_idx: int = arr.length() - 1
+    let val: String = arr[last_idx]
+    arr.pop()
+    if arr.length() == 0 {
+        g_lists.remove(key)
+    }
+    return val
+}
+
+// RPOP key -> last element or "" if empty/missing
+fn kv_rpop(key: String) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_lists.contains(key) == false { return "" }
+    let arr: Array = g_lists.get(key)
+    if arr.length() == 0 { return "" }
+    let val: String = arr[0]
+    let rest: Array = arr.slice(1, arr.length())
+    if rest.length() == 0 {
+        g_lists.remove(key)
+    } else {
+        g_lists.insert(key, rest)
+    }
+    return val
+}
+
+// LLEN key -> length or 0 if missing
+fn kv_llen(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_lists.contains(key) == false { return 0 }
+    let arr: Array = g_lists.get(key)
+    return arr.length()
+}
+
+// LRANGE key start stop -> subarray (inclusive, supports negative indices)
+// Internal storage is reversed, so we map logical indices to internal ones.
+fn kv_lrange(key: String, start: int, stop: int) -> Array {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_lists.contains(key) == false { return [] }
+    let arr: Array = g_lists.get(key)
+    let len: int = arr.length()
+    // Normalize negative indices
+    var s: int = start
+    var e: int = stop
+    if s < 0 { s = s + len }
+    if e < 0 { e = e + len }
+    // Clamp
+    if s < 0 { s = 0 }
+    if e >= len { e = len - 1 }
+    if s > e { return [] }
+    // Map logical range to internal reversed storage
+    // logical index i → internal index (len - 1 - i)
+    let i_start: int = len - 1 - e
+    let i_end: int = len - 1 - s
+    let sliced: Array = arr.slice(i_start, i_end + 1)
+    // Reverse the slice to get logical order
+    sliced.reverse()
+    return sliced
+}
+
+// LINDEX key index -> element or "" if out of range
+// Internal storage is reversed: logical index i → internal (len-1-i)
+fn kv_lindex(key: String, index: int) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_lists.contains(key) == false { return "" }
+    let arr: Array = g_lists.get(key)
+    let len: int = arr.length()
+    var idx: int = index
+    if idx < 0 { idx = idx + len }
+    if idx < 0 or idx >= len { return "" }
+    let internal_idx: int = len - 1 - idx
+    let val: String = arr[internal_idx]
+    return val
+}
+
+// === Additional string operations ===
+
+// SETNX key value -> 1 if set, 0 if already exists
+fn kv_setnx(key: String, value: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) or g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return 0 }
+    g_store.insert(key, value)
+    g_changes_since_save = g_changes_since_save + 1
+    return 1
+}
+
+// SETEX key seconds value -> 1 (SET + EXPIRE atomically)
+fn kv_setex(key: String, seconds: int, value: String) -> int {
+    kv_set(key, value)
+    kv_expire(key, seconds)
+    return 1
+}
+
+// APPEND key value -> new byte length
+fn kv_append(key: String, value: String) -> int {
+    kv_check_expired(key)
+    if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_store.contains(key) {
+        let old: String = g_store.get(key)
+        let new_val: String = old + value
+        g_store.insert(key, new_val)
+        return str_byte_length(new_val)
+    }
+    g_store.insert(key, value)
+    return str_byte_length(value)
+}
+
+// STRLEN key -> byte length of value, 0 if missing
+fn kv_strlen(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_store.contains(key) {
+        let val: String = g_store.get(key)
+        return str_byte_length(val)
+    }
+    return 0
+}
+
+// GETSET key value -> old value or "" if didn't exist
+fn kv_getset(key: String, value: String) -> String {
+    let old: String = kv_get(key)
+    kv_set(key, value)
+    return old
+}
+
+// === Set operations (flat key encoding: g_set_members["key::member"] = 1) ===
+
+// Helper: remove all flat entries for a set key
+fn kv_set_cleanup(key: String) {
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_set_members.keys()
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                g_set_members.remove(k)
+            }
+        }
+    }
+}
+
+// SADD key member -> 1 if added, 0 if already existed, -1 if WRONGTYPE
+fn kv_sadd(key: String, member: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_lists.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    let flat_key: String = key + "::" + member
+    if g_set_members.contains(flat_key) { return 0 }
+    g_set_members.insert(flat_key, 1)
+    // Track count in g_sets
+    if g_sets.contains(key) {
+        let count: int = g_sets.get(key)
+        g_sets.insert(key, count + 1)
+    } else {
+        g_sets.insert(key, 1)
+    }
+    return 1
+}
+
+// SREM key member -> 1 if removed, 0 if not found, -1 if WRONGTYPE
+fn kv_srem(key: String, member: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_lists.contains(key) or g_hashes.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    if g_sets.contains(key) == false { return 0 }
+    let flat_key: String = key + "::" + member
+    if g_set_members.contains(flat_key) == false { return 0 }
+    g_set_members.remove(flat_key)
+    let count: int = g_sets.get(key)
+    if count <= 1 {
+        g_sets.remove(key)
+    } else {
+        g_sets.insert(key, count - 1)
+    }
+    return 1
+}
+
+// SISMEMBER key member -> 1 if member exists, 0 if not
+fn kv_sismember(key: String, member: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    let flat_key: String = key + "::" + member
+    if g_set_members.contains(flat_key) { return 1 }
+    return 0
+}
+
+// SMEMBERS key -> Array of all members
+fn kv_smembers(key: String) -> Array {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_sets.contains(key) == false { return [] }
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_set_members.keys()
+    let result: Array = []
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                let member: String = k.substring(prefix_len, k.length())
+                result.push(member)
+            }
+        }
+    }
+    return result
+}
+
+// SCARD key -> number of members, 0 if not exists
+fn kv_scard(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_sets.contains(key) == false { return 0 }
+    let count: int = g_sets.get(key)
+    return count
+}
+
+// === Hash operations (flat key encoding: g_hash_fields["key::field"] = value) ===
+
+// Helper: remove all flat entries for a hash key
+fn kv_hash_cleanup(key: String) {
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_hash_fields.keys()
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                g_hash_fields.remove(k)
+            }
+        }
+    }
+}
+
+// HSET key field value -> 1 if new field, 0 if updated, -1 if WRONGTYPE
+fn kv_hset(key: String, field: String, value: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_lists.contains(key) or g_sets.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    let flat_key: String = key + "::" + field
+    var is_new: int = 0
+    if g_hash_fields.contains(flat_key) == false { is_new = 1 }
+    g_hash_fields.insert(flat_key, value)
+    // Track count in g_hashes
+    if g_hashes.contains(key) {
+        if is_new == 1 {
+            let count: int = g_hashes.get(key)
+            g_hashes.insert(key, count + 1)
+        }
+    } else {
+        g_hashes.insert(key, 1)
+    }
+    return is_new
+}
+
+// HGET key field -> value or "" if not found
+fn kv_hget(key: String, field: String) -> String {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    let flat_key: String = key + "::" + field
+    if g_hash_fields.contains(flat_key) == false { return "" }
+    let val: String = g_hash_fields.get(flat_key)
+    return val
+}
+
+// HDEL key field -> 1 if removed, 0 if not found, -1 if WRONGTYPE
+fn kv_hdel(key: String, field: String) -> int {
+    kv_check_expired(key)
+    if g_store.contains(key) or g_lists.contains(key) or g_sets.contains(key) { return 0 - 1 }
+    g_ops_total = g_ops_total + 1
+    if g_hashes.contains(key) == false { return 0 }
+    let flat_key: String = key + "::" + field
+    if g_hash_fields.contains(flat_key) == false { return 0 }
+    g_hash_fields.remove(flat_key)
+    let count: int = g_hashes.get(key)
+    if count <= 1 {
+        g_hashes.remove(key)
+    } else {
+        g_hashes.insert(key, count - 1)
+    }
+    g_changes_since_save = g_changes_since_save + 1
+    return 1
+}
+
+// HGETALL key -> interleaved Array [field1, val1, field2, val2, ...]
+fn kv_hgetall(key: String) -> Array {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_hashes.contains(key) == false { return [] }
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_hash_fields.keys()
+    let result: Array = []
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                let field: String = k.substring(prefix_len, k.length())
+                result.push(field)
+                let val: String = g_hash_fields.get(k)
+                result.push(val)
+            }
+        }
+    }
+    return result
+}
+
+// HKEYS key -> Array of field names
+fn kv_hkeys(key: String) -> Array {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_hashes.contains(key) == false { return [] }
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_hash_fields.keys()
+    let result: Array = []
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                let field: String = k.substring(prefix_len, k.length())
+                result.push(field)
+            }
+        }
+    }
+    return result
+}
+
+// HVALS key -> Array of values
+fn kv_hvals(key: String) -> Array {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_hashes.contains(key) == false { return [] }
+    let prefix: String = key + "::"
+    let prefix_len: int = prefix.length()
+    let all: Array = g_hash_fields.keys()
+    let result: Array = []
+    for k: String in all {
+        if k.length() >= prefix_len {
+            let sub: String = k.substring(0, prefix_len)
+            if sub == prefix {
+                let val: String = g_hash_fields.get(k)
+                result.push(val)
+            }
+        }
+    }
+    return result
+}
+
+// HEXISTS key field -> 1 if field exists, 0 if not
+fn kv_hexists(key: String, field: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    let flat_key: String = key + "::" + field
+    if g_hash_fields.contains(flat_key) { return 1 }
+    return 0
+}
+
+// HLEN key -> number of fields, 0 if not exists
+fn kv_hlen(key: String) -> int {
+    kv_check_expired(key)
+    g_ops_total = g_ops_total + 1
+    if g_hashes.contains(key) == false { return 0 }
+    let count: int = g_hashes.get(key)
+    return count
+}

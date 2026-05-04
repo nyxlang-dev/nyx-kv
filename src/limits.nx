@@ -1,0 +1,118 @@
+// limits.nx — Rate limiting and free tier enforcement for nyx-kv
+// Set g_public_mode = 0 for private/development use (no limits)
+
+// Public mode: 1 = apply rate limits and free tier, 0 = no limits
+var g_public_mode: int = 0
+
+// Rate limit: requests per second per IP
+var RATE_LIMIT: int = 1000
+// Max keys per IP
+var MAX_KEYS_PER_IP: int = 10000
+// Max value size in bytes (1 MB)
+var MAX_VALUE_BYTES: int = 1048576
+// Max TTL in seconds (24 hours)
+var MAX_TTL_SECONDS: int = 86400
+
+// Rate limit tracking (int values — safe for global Maps)
+var g_rate_ts: Map = Map.new()
+var g_rate_count: Map = Map.new()
+// Key ownership tracking (int values only)
+var g_key_owner: Map = Map.new()
+
+// Initialize limits maps (call from main before spawning threads)
+pub fn init_limits() {
+    g_rate_ts = Map.new()
+    g_rate_count = Map.new()
+    g_key_owner = Map.new()
+}
+
+// Get client IP from fd via getpeername syscall
+fn get_client_ip(fd: int) -> String {
+    let ip: String = getpeername(fd)
+    return ip
+}
+
+// Check rate limit for IP. Returns "" if OK, RESP error if exceeded.
+pub fn check_rate_limit(ip: String) -> String {
+    let now: int = time_us()
+    if g_rate_ts.contains(ip) {
+        let last_ts: int = g_rate_ts.get(ip)
+        let elapsed: int = now - last_ts
+        if elapsed < 1000000 {
+            // Within same 1-second window
+            let count: int = g_rate_count.get(ip)
+            if count >= RATE_LIMIT {
+                return "-ERR rate limit exceeded, max 1000 req/s\r\n"
+            }
+            g_rate_count.insert(ip, count + 1)
+            return ""
+        }
+    }
+    // New window
+    g_rate_ts.insert(ip, now)
+    g_rate_count.insert(ip, 1)
+    return ""
+}
+
+// Check key limit for IP. Returns "" if OK, RESP error if exceeded.
+pub fn check_key_limit(ip: String, key: String) -> String {
+    // If key already exists in store or lists, it's an update — always OK
+    if g_store.contains(key) { return "" }
+    if g_lists.contains(key) { return "" }
+    if g_sets.contains(key) { return "" }
+    if g_hashes.contains(key) { return "" }
+    // Check count
+    var count: int = 0
+    if g_key_owner.contains(ip) {
+        count = g_key_owner.get(ip)
+    }
+    if count >= MAX_KEYS_PER_IP {
+        return "-ERR free tier limit: max 10000 keys per IP\r\n"
+    }
+    // Register new key for this IP
+    g_key_owner.insert(ip, count + 1)
+    return ""
+}
+
+// Check value size. Returns "" if OK, RESP error if exceeded.
+pub fn check_value_size(value: String) -> String {
+    let size: int = str_byte_length(value)
+    if size > MAX_VALUE_BYTES {
+        return "-ERR free tier limit: max 1MB per value\r\n"
+    }
+    return ""
+}
+
+// Enforce 24h TTL on a key
+pub fn enforce_ttl(key: String) {
+    kv_expire(key, MAX_TTL_SECONDS)
+}
+
+// Cap EXPIRE seconds to 24h max
+pub fn cap_ttl(seconds: int) -> int {
+    if seconds > MAX_TTL_SECONDS {
+        return MAX_TTL_SECONDS
+    }
+    return seconds
+}
+
+// Check if command is disabled. Returns "" if OK, RESP error if disabled.
+pub fn is_command_disabled(name: String) -> String {
+    if name == "FLUSHDB" {
+        return "-ERR command disabled in free tier\r\n"
+    }
+    if name == "CONFIG" {
+        return "-ERR command disabled in free tier\r\n"
+    }
+    return ""
+}
+
+// Track key deletion — decrement owner count for IP
+pub fn track_key_delete(ip: String) {
+    if g_key_owner.contains(ip) {
+        let count: int = g_key_owner.get(ip)
+        if count > 0 {
+            g_key_owner.insert(ip, count - 1)
+        }
+    }
+}

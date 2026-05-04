@@ -1,0 +1,896 @@
+// commands.nx — Command dispatch for nyx-kv
+// Receives parsed RESP command array, executes on store, returns RESP response
+// Returns "" if response was already written directly to fd.
+
+// Cached constant responses (avoid allocation per request)
+var RESP_OK: String = "+OK\r\n"
+var RESP_PONG: String = "+PONG\r\n"
+var RESP_NULL: String = "$-1\r\n"
+var RESP_ZERO: String = ":0\r\n"
+var RESP_ONE: String = ":1\r\n"
+var RESP_EMPTY_ARR: String = "*0\r\n"
+var RESP_WRONGTYPE: String = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+
+// Dispatch a parsed command and return the RESP response string.
+// All commands return the response as a string — the worker writes it to
+// the appropriate socket (plain fd or TLS SSL handle). An earlier version
+// had GET write directly to the raw fd as a "fast path", which broke TLS
+// completely; do not re-introduce that pattern.
+fn dispatch_command(cmd: Array, fd: int) -> String {
+    if cmd.length() == 0 {
+        return resp_error("empty command")
+    }
+
+    // Rate limiting (only in public mode)
+    if g_public_mode == 1 {
+        let ip: String = get_client_ip(fd)
+        let rl: String = check_rate_limit(ip)
+        if rl.length() > 0 { return rl }
+    }
+
+    let raw: String = cmd[0]
+
+    // Handle AUTH before namespace prefixing
+    if raw == "AUTH" or raw == "auth" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'AUTH' command")
+        }
+        let token: String = cmd[1]
+        return auth_login(fd, token)
+    }
+
+    // Handle WHOAMI
+    if raw == "WHOAMI" or raw == "whoami" {
+        let info: String = auth_whoami(fd)
+        return resp_bulk_string(info)
+    }
+
+    // Handle TOKEN_CREATE (admin only, localhost)
+    // Syntax: TOKEN_CREATE user plan [ttl_seconds]
+    if raw == "TOKEN_CREATE" or raw == "token_create" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'TOKEN_CREATE' command")
+        }
+        let user_id: String = cmd[1]
+        let plan: String = cmd[2]
+        var ttl: int = 0
+        if cmd.length() >= 4 {
+            let ttl_arg: String = cmd[3]
+            ttl = string_to_int(ttl_arg)
+        }
+        let token: String = auth_create_token(fd, user_id, plan, ttl)
+        if token.length() == 0 {
+            return resp_error("TOKEN_CREATE failed (localhost only, valid plans: free/pro/enterprise)")
+        }
+        return resp_bulk_string(token)
+    }
+
+    // Handle TOKEN_REVOKE (admin only, localhost)
+    if raw == "TOKEN_REVOKE" or raw == "token_revoke" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TOKEN_REVOKE' command")
+        }
+        let revoke_token: String = cmd[1]
+        let ok: bool = auth_revoke_token(fd, revoke_token)
+        if ok == false {
+            return resp_error("TOKEN_REVOKE failed (localhost only or token not found)")
+        }
+        return RESP_OK
+    }
+
+    // Handle TOKEN_LIST (admin only, localhost)
+    if raw == "TOKEN_LIST" or raw == "token_list" {
+        return auth_list_tokens(fd)
+    }
+
+    // Namespace prefixing: transparently prefix keys with user_id::
+    // Applied to all key-bearing commands for authenticated users
+    if g_public_mode == 1 {
+        let user_id: String = auth_get_user(fd)
+        if user_id.length() > 0 {
+            let upper: String = raw.toUpper()
+            // Commands with key at position 1
+            if upper == "SET" or upper == "GET" or upper == "DEL" or upper == "EXISTS" or upper == "EXPIRE" or upper == "TTL" or upper == "PERSIST" or upper == "INCR" or upper == "DECR" or upper == "TYPE" or upper == "SETNX" or upper == "SETEX" or upper == "APPEND" or upper == "STRLEN" or upper == "GETSET" or upper == "LPUSH" or upper == "RPUSH" or upper == "LPOP" or upper == "RPOP" or upper == "LLEN" or upper == "LRANGE" or upper == "LINDEX" or upper == "SADD" or upper == "SREM" or upper == "SISMEMBER" or upper == "SMEMBERS" or upper == "SCARD" or upper == "HSET" or upper == "HGET" or upper == "HDEL" or upper == "HGETALL" or upper == "HKEYS" or upper == "HVALS" or upper == "HEXISTS" or upper == "HLEN" {
+                if cmd.length() >= 2 {
+                    let orig_key: String = cmd[1]
+                    cmd[1] = user_id + "::" + orig_key
+                }
+            }
+            // MSET: keys at positions 1, 3, 5, ...
+            if upper == "MSET" {
+                var mi: int = 1
+                while mi < cmd.length() {
+                    let orig_key: String = cmd[mi]
+                    cmd[mi] = user_id + "::" + orig_key
+                    mi = mi + 2
+                }
+            }
+            // MGET: keys at positions 1, 2, 3, ...
+            if upper == "MGET" {
+                var mi: int = 1
+                while mi < cmd.length() {
+                    let orig_key: String = cmd[mi]
+                    cmd[mi] = user_id + "::" + orig_key
+                    mi = mi + 1
+                }
+            }
+            // DEL with multiple keys
+            if upper == "DEL" and cmd.length() > 2 {
+                var di: int = 2
+                while di < cmd.length() {
+                    let orig_key: String = cmd[di]
+                    cmd[di] = user_id + "::" + orig_key
+                    di = di + 1
+                }
+            }
+        } else {
+            // Anonymous in public mode: block access to namespaced keys (containing ::)
+            if cmd.length() >= 2 {
+                let anon_key: String = cmd[1]
+                let anon_sep: int = anon_key.indexOf("::")
+                if anon_sep >= 0 {
+                    return resp_error("access denied: cannot access namespaced keys")
+                }
+            }
+        }
+    }
+
+    let first: int = raw.charAt(0)
+
+    // === Fast path: SET (S=83, s=115) — ~50% of benchmark traffic ===
+    if first == 83 or first == 115 {
+        if raw == "SET" or raw == "set" {
+            if cmd.length() < 3 {
+                return resp_error("wrong number of arguments for 'SET' command")
+            }
+            let key: String = cmd[1]
+            let value: String = cmd[2]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                let ip: String = get_client_ip(fd)
+                let kl: String = check_key_limit(ip, key)
+                if kl.length() > 0 { return kl }
+            }
+            if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+            g_store.insert(key, value)
+            if g_ttl.size() > 0 {
+                if g_ttl.contains(key) { g_ttl.remove(key) }
+            }
+            g_ops_total = g_ops_total + 1
+            g_changes_since_save = g_changes_since_save + 1
+            if g_public_mode == 1 { enforce_ttl(key) }
+            return RESP_OK
+        }
+    }
+
+    // === Fast path: GET (G=71, g=103) — ~50% of benchmark traffic ===
+    if first == 71 or first == 103 {
+        if raw == "GET" or raw == "get" {
+            if cmd.length() < 2 {
+                return resp_error("wrong number of arguments for 'GET' command")
+            }
+            let key: String = cmd[1]
+            if g_ttl.size() > 0 { kv_check_expired(key) }
+            g_ops_total = g_ops_total + 1
+            if g_store.contains(key) == false {
+                return RESP_NULL
+            }
+            let val: String = g_store.get(key)
+            // NOTE: an earlier "fast path" wrote the bulk string directly to
+            // the raw fd via resp_write_bulk(fd, val) and returned "". That
+            // bypassed the TLS worker (which writes to the SSL handle, not
+            // the raw socket) and made every TLS GET silently lose its
+            // response. Returning the bulk string here costs one allocation
+            // per GET but works uniformly across plain TCP and TLS workers.
+            return resp_bulk_string(val)
+        }
+    }
+
+    // === Fast path: PING (P=80, p=112) ===
+    if first == 80 or first == 112 {
+        if raw == "PING" or raw == "ping" {
+            if cmd.length() > 1 {
+                let msg: String = cmd[1]
+                return resp_bulk_string(msg)
+            }
+            return RESP_PONG
+        }
+    }
+
+    // === Slow path: toUpper for all other commands ===
+    let name: String = raw.toUpper()
+
+    // DEL key [key ...]
+    if name == "DEL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'DEL' command")
+        }
+        var deleted: int = 0
+        var i: int = 1
+        while i < cmd.length() {
+            let key: String = cmd[i]
+            let d: int = kv_del(key)
+            if d == 1 and g_public_mode == 1 { track_key_delete(get_client_ip(fd)) }
+            deleted = deleted + d
+            i = i + 1
+        }
+        return resp_integer(deleted)
+    }
+
+    // EXISTS key
+    if name == "EXISTS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'EXISTS' command")
+        }
+        let key: String = cmd[1]
+        let ex: int = kv_exists(key)
+        if ex == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // KEYS *
+    if name == "KEYS" {
+        let keys: Array = kv_keys()
+        if g_public_mode == 1 {
+            let user_id: String = auth_get_user(fd)
+            let filtered: Array = []
+            var ki: int = 0
+            if user_id.length() > 0 {
+                // Authenticated: only keys with user's prefix, strip prefix
+                let prefix: String = user_id + "::"
+                let prefix_len: int = prefix.length()
+                while ki < keys.length() {
+                    let k: String = keys[ki]
+                    if k.length() >= prefix_len {
+                        let kp: String = k.substring(0, prefix_len)
+                        if kp == prefix {
+                            let stripped: String = k.substring(prefix_len, k.length())
+                            filtered.push(stripped)
+                        }
+                    }
+                    ki = ki + 1
+                }
+            } else {
+                // Anonymous: only keys WITHOUT :: (not namespaced)
+                while ki < keys.length() {
+                    let k: String = keys[ki]
+                    let sep: int = k.indexOf("::")
+                    if sep < 0 {
+                        filtered.push(k)
+                    }
+                    ki = ki + 1
+                }
+            }
+            if filtered.length() > 100 {
+                let limited: Array = []
+                ki = 0
+                while ki < 100 {
+                    limited.push(filtered[ki])
+                    ki = ki + 1
+                }
+                return resp_bulk_array(limited)
+            }
+            return resp_bulk_array(filtered)
+        }
+        return resp_bulk_array(keys)
+    }
+
+    // EXPIRE key seconds
+    if name == "EXPIRE" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'EXPIRE' command")
+        }
+        let key: String = cmd[1]
+        let sec_str: String = cmd[2]
+        var seconds: int = string_to_int(sec_str)
+        if g_public_mode == 1 { seconds = cap_ttl(seconds) }
+        return resp_integer(kv_expire(key, seconds))
+    }
+
+    // TTL key
+    if name == "TTL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TTL' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_ttl(key))
+    }
+
+    // PERSIST key
+    if name == "PERSIST" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'PERSIST' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_persist(key))
+    }
+
+    // INCR key
+    if name == "INCR" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'INCR' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_incr(key))
+    }
+
+    // DECR key
+    if name == "DECR" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'DECR' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_decr(key))
+    }
+
+    // MSET k1 v1 k2 v2 ...
+    if name == "MSET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'MSET' command")
+        }
+        var i: int = 1
+        while i + 1 < cmd.length() {
+            let key: String = cmd[i]
+            let value: String = cmd[i + 1]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                let ip: String = get_client_ip(fd)
+                let kl: String = check_key_limit(ip, key)
+                if kl.length() > 0 { return kl }
+            }
+            kv_set(key, value)
+            if g_public_mode == 1 { enforce_ttl(key) }
+            i = i + 2
+        }
+        return RESP_OK
+    }
+
+    // MGET k1 k2 ...
+    if name == "MGET" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'MGET' command")
+        }
+        let values: Array = []
+        let flags: Array = []
+        var i: int = 1
+        while i < cmd.length() {
+            let key: String = cmd[i]
+            if kv_exists(key) == 1 {
+                values.push(kv_get(key))
+                flags.push(1)
+            } else {
+                values.push("")
+                flags.push(0)
+            }
+            i = i + 1
+        }
+        return resp_mixed_array(values, flags)
+    }
+
+    // DBSIZE
+    if name == "DBSIZE" {
+        if g_public_mode == 1 {
+            let user_id: String = auth_get_user(fd)
+            if user_id.length() > 0 {
+                // Count only keys in user's namespace
+                let keys: Array = kv_keys()
+                let prefix: String = user_id + "::"
+                let prefix_len: int = prefix.length()
+                var count: int = 0
+                var di: int = 0
+                while di < keys.length() {
+                    let k: String = keys[di]
+                    if k.length() >= prefix_len {
+                        let kp: String = k.substring(0, prefix_len)
+                        if kp == prefix { count = count + 1 }
+                    }
+                    di = di + 1
+                }
+                return resp_integer(count)
+            } else {
+                // Anonymous: count only non-namespaced keys
+                let keys: Array = kv_keys()
+                var count: int = 0
+                var di: int = 0
+                while di < keys.length() {
+                    let k: String = keys[di]
+                    let sep: int = k.indexOf("::")
+                    if sep < 0 { count = count + 1 }
+                    di = di + 1
+                }
+                return resp_integer(count)
+            }
+        }
+        return resp_integer(kv_dbsize())
+    }
+
+    // FLUSHDB
+    if name == "FLUSHDB" {
+        if g_public_mode == 1 { return is_command_disabled("FLUSHDB") }
+        kv_flushdb()
+        return RESP_OK
+    }
+
+    // INFO
+    if name == "INFO" {
+        var sb: StringBuilder = StringBuilder.new()
+        sb.append("# Server\r\n")
+        sb.append("nyx_kv_version:0.2.0\r\n")
+        sb.append("# Stats\r\n")
+        sb.append("total_commands_processed:" + int_to_string(g_ops_total) + "\r\n")
+        sb.append("# Keyspace\r\n")
+        sb.append("db0:keys=" + int_to_string(g_store.size()) + ",list_keys=" + int_to_string(g_lists.size()) + ",set_keys=" + int_to_string(g_sets.size()) + ",hash_keys=" + int_to_string(g_hashes.size()) + "\r\n")
+        return resp_bulk_string(sb.to_string())
+    }
+
+    // CONFIG (redis-benchmark sends CONFIG GET save at startup)
+    if name == "CONFIG" {
+        if g_public_mode == 1 { return is_command_disabled("CONFIG") }
+        return RESP_EMPTY_ARR
+    }
+
+    // COMMAND / COMMAND DOCS (redis-benchmark sends this)
+    if name == "COMMAND" {
+        return RESP_EMPTY_ARR
+    }
+
+    // === List commands ===
+
+    // LPUSH key value [value ...]
+    if name == "LPUSH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'LPUSH' command")
+        }
+        let key: String = cmd[1]
+        var i: int = 2
+        var result: int = 0
+        while i < cmd.length() {
+            let value: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            result = kv_lpush(key, value)
+            if result == 0 - 1 { return RESP_WRONGTYPE }
+            i = i + 1
+        }
+        if g_public_mode == 1 { enforce_ttl(key) }
+        return resp_integer(result)
+    }
+
+    // RPUSH key value [value ...]
+    if name == "RPUSH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'RPUSH' command")
+        }
+        let key: String = cmd[1]
+        var i: int = 2
+        var result: int = 0
+        while i < cmd.length() {
+            let value: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            result = kv_rpush(key, value)
+            if result == 0 - 1 { return RESP_WRONGTYPE }
+            i = i + 1
+        }
+        if g_public_mode == 1 { enforce_ttl(key) }
+        return resp_integer(result)
+    }
+
+    // LPOP key
+    if name == "LPOP" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'LPOP' command")
+        }
+        let key: String = cmd[1]
+        let val: String = kv_lpop(key)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // RPOP key
+    if name == "RPOP" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'RPOP' command")
+        }
+        let key: String = cmd[1]
+        let val: String = kv_rpop(key)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // LLEN key
+    if name == "LLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'LLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_llen(key))
+    }
+
+    // LRANGE key start stop
+    if name == "LRANGE" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'LRANGE' command")
+        }
+        let key: String = cmd[1]
+        let start_str: String = cmd[2]
+        let stop_str: String = cmd[3]
+        let start: int = string_to_int(start_str)
+        let stop: int = string_to_int(stop_str)
+        let result: Array = kv_lrange(key, start, stop)
+        return resp_bulk_array(result)
+    }
+
+    // LINDEX key index
+    if name == "LINDEX" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'LINDEX' command")
+        }
+        let key: String = cmd[1]
+        let idx_str: String = cmd[2]
+        let idx: int = string_to_int(idx_str)
+        let val: String = kv_lindex(key, idx)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // TYPE key
+    if name == "TYPE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TYPE' command")
+        }
+        let key: String = cmd[1]
+        return resp_simple_string(kv_type(key))
+    }
+
+    // === Additional string commands ===
+
+    // SETNX key value
+    if name == "SETNX" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SETNX' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+            let ip: String = get_client_ip(fd)
+            let kl: String = check_key_limit(ip, key)
+            if kl.length() > 0 { return kl }
+        }
+        let result: int = kv_setnx(key, value)
+        if result == 1 and g_public_mode == 1 { enforce_ttl(key) }
+        if result == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // SETEX key seconds value
+    if name == "SETEX" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'SETEX' command")
+        }
+        let key: String = cmd[1]
+        let sec_str: String = cmd[2]
+        let value: String = cmd[3]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+            let ip: String = get_client_ip(fd)
+            let kl: String = check_key_limit(ip, key)
+            if kl.length() > 0 { return kl }
+        }
+        var seconds: int = string_to_int(sec_str)
+        if g_public_mode == 1 { seconds = cap_ttl(seconds) }
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        kv_setex(key, seconds, value)
+        return RESP_OK
+    }
+
+    // APPEND key value
+    if name == "APPEND" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'APPEND' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+        }
+        let result: int = kv_append(key, value)
+        if result == 0 - 1 { return RESP_WRONGTYPE }
+        return resp_integer(result)
+    }
+
+    // STRLEN key
+    if name == "STRLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'STRLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_strlen(key))
+    }
+
+    // GETSET key value
+    if name == "GETSET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'GETSET' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        let old: String = kv_getset(key, value)
+        if old == "" { return RESP_NULL }
+        return resp_bulk_string(old)
+    }
+
+    // === Set commands ===
+
+    // SADD key member [member ...]
+    if name == "SADD" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SADD' command")
+        }
+        let key: String = cmd[1]
+        var added: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let member: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(member)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            let r: int = kv_sadd(key, member)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            added = added + r
+            i = i + 1
+        }
+        if g_public_mode == 1 { enforce_ttl(key) }
+        return resp_integer(added)
+    }
+
+    // SREM key member [member ...]
+    if name == "SREM" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SREM' command")
+        }
+        let key: String = cmd[1]
+        var removed: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let member: String = cmd[i]
+            let r: int = kv_srem(key, member)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            removed = removed + r
+            i = i + 1
+        }
+        return resp_integer(removed)
+    }
+
+    // SISMEMBER key member
+    if name == "SISMEMBER" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SISMEMBER' command")
+        }
+        let key: String = cmd[1]
+        let member: String = cmd[2]
+        let r: int = kv_sismember(key, member)
+        if r == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // SMEMBERS key
+    if name == "SMEMBERS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SMEMBERS' command")
+        }
+        let key: String = cmd[1]
+        let members: Array = kv_smembers(key)
+        return resp_bulk_array(members)
+    }
+
+    // SCARD key
+    if name == "SCARD" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SCARD' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_scard(key))
+    }
+
+    // === Hash commands ===
+
+    // HSET key field value [field value ...]
+    if name == "HSET" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'HSET' command")
+        }
+        let key: String = cmd[1]
+        var new_fields: int = 0
+        var i: int = 2
+        while i + 1 < cmd.length() {
+            let field: String = cmd[i]
+            let value: String = cmd[i + 1]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            let r: int = kv_hset(key, field, value)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            new_fields = new_fields + r
+            i = i + 2
+        }
+        if g_public_mode == 1 { enforce_ttl(key) }
+        return resp_integer(new_fields)
+    }
+
+    // HGET key field
+    if name == "HGET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HGET' command")
+        }
+        let key: String = cmd[1]
+        let field: String = cmd[2]
+        let val: String = kv_hget(key, field)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // HDEL key field [field ...]
+    if name == "HDEL" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HDEL' command")
+        }
+        let key: String = cmd[1]
+        var removed: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let field: String = cmd[i]
+            let r: int = kv_hdel(key, field)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            removed = removed + r
+            i = i + 1
+        }
+        return resp_integer(removed)
+    }
+
+    // HGETALL key
+    if name == "HGETALL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HGETALL' command")
+        }
+        let key: String = cmd[1]
+        let pairs: Array = kv_hgetall(key)
+        return resp_bulk_array(pairs)
+    }
+
+    // HKEYS key
+    if name == "HKEYS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HKEYS' command")
+        }
+        let key: String = cmd[1]
+        let fields: Array = kv_hkeys(key)
+        return resp_bulk_array(fields)
+    }
+
+    // HVALS key
+    if name == "HVALS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HVALS' command")
+        }
+        let key: String = cmd[1]
+        let vals: Array = kv_hvals(key)
+        return resp_bulk_array(vals)
+    }
+
+    // HEXISTS key field
+    if name == "HEXISTS" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HEXISTS' command")
+        }
+        let key: String = cmd[1]
+        let field: String = cmd[2]
+        let r: int = kv_hexists(key, field)
+        if r == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // HLEN key
+    if name == "HLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_hlen(key))
+    }
+
+    // SAVE — synchronous snapshot
+    if name == "SAVE" {
+        if g_public_mode == 1 {
+            return resp_error("command disabled in free tier")
+        }
+        let saved: int = kv_save(g_save_path)
+        print("[save] saved " + int_to_string(saved) + " keys to " + g_save_path)
+        return RESP_OK
+    }
+
+    // BGSAVE — trigger background save (same as SAVE in this implementation)
+    if name == "BGSAVE" {
+        if g_public_mode == 1 {
+            return resp_error("command disabled in free tier")
+        }
+        let saved: int = kv_save(g_save_path)
+        print("[bgsave] saved " + int_to_string(saved) + " keys to " + g_save_path)
+        return resp_simple_string("Background saving started")
+    }
+
+    // LASTSAVE — return timestamp of last save (seconds since epoch)
+    if name == "LASTSAVE" {
+        let ts: int = g_last_save_time / 1000000
+        return resp_integer(ts)
+    }
+
+    // === Pub/Sub commands ===
+
+    // SUBSCRIBE channel
+    if name == "SUBSCRIBE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SUBSCRIBE' command")
+        }
+        let channel: String = cmd[1]
+        let resp: String = pubsub_subscribe(fd, channel)
+        tcp_write(fd, resp)
+        // Signal worker to enter subscriber loop
+        return "__SUBSCRIBE__"
+    }
+
+    // PUBLISH channel message
+    if name == "PUBLISH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'PUBLISH' command")
+        }
+        let channel: String = cmd[1]
+        let message: String = cmd[2]
+        let count: int = pubsub_publish(channel, message)
+        return resp_integer(count)
+    }
+
+    // UNSUBSCRIBE channel
+    if name == "UNSUBSCRIBE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'UNSUBSCRIBE' command")
+        }
+        let channel: String = cmd[1]
+        return pubsub_unsubscribe(fd, channel)
+    }
+
+    return resp_error("unknown command '" + name + "'")
+}

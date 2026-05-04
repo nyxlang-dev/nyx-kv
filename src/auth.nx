@@ -1,0 +1,328 @@
+// auth.nx — Authentication and multi-tenant support for nyx-kv
+//
+// Design:
+//   - g_auth_tokens: token → "user_id:plan:expires_at"
+//       expires_at = 0 means no expiry; non-zero is Unix timestamp in seconds
+//   - g_auth_sessions: fd → user_id (transient, per-connection)
+//   - Namespace prefixing: all keys are transparently prefixed with user_id::
+//   - Plans: "free" (1K req/s, 10K keys, 1MB value, 24h TTL),
+//            "pro" (10K req/s, 100K keys, 10MB, no forced TTL) — reserved, not enforced yet,
+//            "enterprise" (unlimited) — reserved, not enforced yet
+//   - Anonymous: no AUTH → free tier by IP (current behavior)
+//
+// Note (v0.3.0, 2026-04-24): free tier caps bumped to compete with
+// hosted Redis free tiers (prev: 100 req/s, 1K keys, 100KB, 72h TTL).
+// pro/enterprise tiers reserved in the schema but not enforced — single
+// free tier until there's a reason to gate.
+
+// Token store: token_string → "user_id:plan" (flat encoding, no nested Maps)
+var g_auth_tokens: Map = Map.new()
+
+// Session store: fd (as string) → user_id (transient, cleared on disconnect)
+var g_auth_sessions: Map = Map.new()
+
+// Plan limits
+var PLAN_FREE_RATE: int = 1000
+var PLAN_FREE_KEYS: int = 10000
+var PLAN_FREE_VALUE_SIZE: int = 1048576
+var PLAN_FREE_TTL: int = 86400
+
+var PLAN_PRO_RATE: int = 10000
+var PLAN_PRO_KEYS: int = 100000
+var PLAN_PRO_VALUE_SIZE: int = 10485760
+
+// Parse token info string: "user_id:plan:expires_at"
+// Returns [user_id, plan, expires_at_str] — backward compat with old "user_id:plan"
+fn parse_token_info(info: String) -> Array {
+    let sep1: int = info.indexOf(":")
+    if sep1 < 0 { return [] }
+    let user_id: String = info.substring(0, sep1)
+    let rest: String = info.substring(sep1 + 1, info.length())
+    let sep2: int = rest.indexOf(":")
+    if sep2 < 0 {
+        // Old format: "user_id:plan" — no expiry
+        let result: Array = [user_id, rest, "0"]
+        return result
+    }
+    let plan: String = rest.substring(0, sep2)
+    let expires_str: String = rest.substring(sep2 + 1, rest.length())
+    let result: Array = [user_id, plan, expires_str]
+    return result
+}
+
+// Authenticate a connection with a token
+// Returns: "+OK\r\n" on success, "-ERR ..." on failure
+pub fn auth_login(fd: int, token: String) -> String {
+    if g_auth_tokens.contains(token) == false {
+        return "-ERR invalid token\r\n"
+    }
+    let info: String = g_auth_tokens.get(token)
+    let parts: Array = parse_token_info(info)
+    if parts.length() < 3 {
+        return "-ERR corrupted token data\r\n"
+    }
+    // Check expiry
+    let expires_str: String = parts[2]
+    let expires_at: int = string_to_int(expires_str)
+    if expires_at > 0 {
+        let now: int = time_ms() / 1000
+        if now > expires_at {
+            return "-ERR token expired\r\n"
+        }
+    }
+    let user_id: String = parts[0]
+    let fd_key: String = int_to_string(fd)
+    g_auth_sessions.insert(fd_key, user_id)
+    return "+OK\r\n"
+}
+
+// Get the user_id for a connection (empty string if anonymous)
+pub fn auth_get_user(fd: int) -> String {
+    let fd_key: String = int_to_string(fd)
+    if g_auth_sessions.contains(fd_key) {
+        let user_id: String = g_auth_sessions.get(fd_key)
+        return user_id
+    }
+    return ""
+}
+
+// Get the plan for a user_id ("free", "pro", "enterprise")
+// Scans g_auth_tokens to find the user's plan
+pub fn auth_get_plan(user_id: String) -> String {
+    let tokens: Array = g_auth_tokens.keys()
+    var i: int = 0
+    while i < tokens.length() {
+        let token: String = tokens[i]
+        let info: String = g_auth_tokens.get(token)
+        let parts: Array = parse_token_info(info)
+        if parts.length() >= 2 {
+            let uid: String = parts[0]
+            if uid == user_id {
+                let plan: String = parts[1]
+                return plan
+            }
+        }
+        i = i + 1
+    }
+    return "free"
+}
+
+// Clean up session when connection closes
+pub fn auth_disconnect(fd: int) {
+    let fd_key: String = int_to_string(fd)
+    if g_auth_sessions.contains(fd_key) {
+        g_auth_sessions.remove(fd_key)
+    }
+}
+
+// Prefix a key with user namespace (user_id::key)
+// Anonymous users get no prefix (backward compatible)
+pub fn auth_prefix_key(fd: int, key: String) -> String {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 {
+        return key
+    }
+    return user_id + "::" + key
+}
+
+// Check if a key belongs to the current user's namespace
+// Prevents accessing other users' keys
+pub fn auth_check_key(fd: int, key: String) -> bool {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 {
+        // Anonymous: can only access unprefixed keys
+        // Block access to keys that look like namespaced keys (contain ::)
+        let sep: int = key.indexOf("::")
+        if sep >= 0 { return false }
+        return true
+    }
+    // Authenticated: key must start with user_id::
+    let prefix: String = user_id + "::"
+    if key.length() >= prefix.length() {
+        let key_prefix: String = key.substring(0, prefix.length())
+        if key_prefix == prefix { return true }
+    }
+    return false
+}
+
+// Create a new token (admin only — must be called from localhost)
+// ttl_seconds = 0 means no expiry
+// Returns the token string on success, empty string on failure
+pub fn auth_create_token(fd: int, user_id: String, plan: String, ttl_seconds: int) -> String {
+    // Verify localhost
+    let ip: String = getpeername(fd)
+    if ip != "127.0.0.1" {
+        return ""
+    }
+    // Validate plan
+    if plan != "free" and plan != "pro" and plan != "enterprise" {
+        return ""
+    }
+    // Compute expiry
+    var expires_at: int = 0
+    if ttl_seconds > 0 {
+        expires_at = time_ms() / 1000 + ttl_seconds
+    }
+    // Generate token: hex string from random bytes
+    let token: String = generate_auth_token()
+    let info: String = user_id + ":" + plan + ":" + int_to_string(expires_at)
+    g_auth_tokens.insert(token, info)
+    g_changes_since_save = g_changes_since_save + 1
+    return token
+}
+
+// Revoke a token (admin only — localhost)
+// Returns true on success, false if token not found or not localhost
+pub fn auth_revoke_token(fd: int, token: String) -> bool {
+    let ip: String = getpeername(fd)
+    if ip != "127.0.0.1" { return false }
+    if g_auth_tokens.contains(token) == false { return false }
+    g_auth_tokens.remove(token)
+    g_changes_since_save = g_changes_since_save + 1
+    return true
+}
+
+// List all tokens with status (admin only — localhost)
+// Returns RESP bulk array: [token, "user_id:plan:expires_at:status", ...]
+pub fn auth_list_tokens(fd: int) -> String {
+    let ip: String = getpeername(fd)
+    if ip != "127.0.0.1" {
+        return resp_error("TOKEN_LIST admin only (localhost)")
+    }
+    let tokens: Array = g_auth_tokens.keys()
+    let now: int = time_ms() / 1000
+    var lines: Array = []
+    var i: int = 0
+    while i < tokens.length() {
+        let token: String = tokens[i]
+        let info: String = g_auth_tokens.get(token)
+        let parts: Array = parse_token_info(info)
+        var status: String = "active"
+        if parts.length() >= 3 {
+            let expires_str: String = parts[2]
+            let expires_at: int = string_to_int(expires_str)
+            if expires_at > 0 and now > expires_at {
+                status = "expired"
+            }
+        }
+        lines.push(token)
+        lines.push(info + ":" + status)
+        i = i + 1
+    }
+    return resp_bulk_array(lines)
+}
+
+// Generate a random hex token (32 bytes = 64 hex chars)
+fn generate_auth_token() -> String {
+    var token: String = ""
+    var i: int = 0
+    while i < 32 {
+        let b: int = random_range(0, 255)
+        let hi: int = (b >> 4) & 15
+        let lo: int = b & 15
+        token = token + hex_digit(hi) + hex_digit(lo)
+        i = i + 1
+    }
+    return token
+}
+
+fn hex_digit(n: int) -> String {
+    if n == 0 { return "0" }
+    if n == 1 { return "1" }
+    if n == 2 { return "2" }
+    if n == 3 { return "3" }
+    if n == 4 { return "4" }
+    if n == 5 { return "5" }
+    if n == 6 { return "6" }
+    if n == 7 { return "7" }
+    if n == 8 { return "8" }
+    if n == 9 { return "9" }
+    if n == 10 { return "a" }
+    if n == 11 { return "b" }
+    if n == 12 { return "c" }
+    if n == 13 { return "d" }
+    if n == 14 { return "e" }
+    return "f"
+}
+
+// WHOAMI: return user info
+pub fn auth_whoami(fd: int) -> String {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 {
+        return "anonymous:free"
+    }
+    let plan: String = auth_get_plan(user_id)
+    return user_id + ":" + plan
+}
+
+// Get rate limit for a user based on plan
+pub fn auth_rate_limit(fd: int) -> int {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 { return PLAN_FREE_RATE }
+    let plan: String = auth_get_plan(user_id)
+    if plan == "pro" { return PLAN_PRO_RATE }
+    if plan == "enterprise" { return 0 }
+    return PLAN_FREE_RATE
+}
+
+// Get max keys for a user based on plan
+pub fn auth_max_keys(fd: int) -> int {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 { return PLAN_FREE_KEYS }
+    let plan: String = auth_get_plan(user_id)
+    if plan == "pro" { return PLAN_PRO_KEYS }
+    if plan == "enterprise" { return 0 }
+    return PLAN_FREE_KEYS
+}
+
+// Get max value size for a user based on plan
+pub fn auth_max_value_size(fd: int) -> int {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 { return PLAN_FREE_VALUE_SIZE }
+    let plan: String = auth_get_plan(user_id)
+    if plan == "pro" { return PLAN_PRO_VALUE_SIZE }
+    if plan == "enterprise" { return 0 }
+    return PLAN_FREE_VALUE_SIZE
+}
+
+// Check if forced TTL applies for this user's plan
+pub fn auth_force_ttl(fd: int) -> bool {
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() == 0 { return true }
+    let plan: String = auth_get_plan(user_id)
+    if plan == "pro" or plan == "enterprise" { return false }
+    return true
+}
+
+// Get token count (for persistence)
+pub fn auth_token_count() -> int {
+    return g_auth_tokens.size()
+}
+
+// Get all tokens as flat array [token1, info1, token2, info2, ...]
+pub fn auth_get_all_tokens() -> Array {
+    let result: Array = []
+    let tokens: Array = g_auth_tokens.keys()
+    var i: int = 0
+    while i < tokens.length() {
+        let token: String = tokens[i]
+        let info: String = g_auth_tokens.get(token)
+        result.push(token)
+        result.push(info)
+        i = i + 1
+    }
+    return result
+}
+
+// Restore a token from persistence
+// Handles old "user_id:plan" and new "user_id:plan:expires_at" formats
+pub fn auth_restore_token(token: String, info: String) {
+    // Normalize old format to new format
+    let sep_count: int = info.length() - info.replace(":", "").length()
+    if sep_count == 1 {
+        // Old format: upgrade to "user_id:plan:0"
+        g_auth_tokens.insert(token, info + ":0")
+    } else {
+        g_auth_tokens.insert(token, info)
+    }
+}

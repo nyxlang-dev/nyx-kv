@@ -1,0 +1,207 @@
+// standalone.nx — Reference runnable example of the nyx-kv library.
+//
+// A fully-functional Redis-compatible KV daemon built directly from the
+// library modules, with the same CLI surface as the production consumer
+// (services/nyxkv/): --port, --public, --tls. This example serves two
+// roles:
+//
+//   - smoke test: `make build` in this directory compiles the full
+//     library end-to-end as a single binary, catching any missing
+//     imports or broken symbols without needing a services/ project
+//   - test-runner target: scripts/testing/run_product_tests.sh compiles
+//     this file and spawns it on a test port to drive the Python test
+//     suite against a real daemon instance
+//
+// Copy the body of main() into your own project's src/main.nx after
+// declaring `nyx-kv = "*"` as a dependency in your nyx.toml and
+// importing from "nyx-kv/src/*". For a production consumer with
+// Let's Encrypt cert wiring for a specific domain, see
+// services/nyxkv/src/main.nx in the NyxLang monorepo.
+
+import "std/random"
+import "std/resp"
+import "src/store"
+import "src/limits"
+import "src/auth"
+import "src/commands"
+import "src/persist"
+import "src/pubsub"
+
+// Shutdown handler: save snapshot on SIGTERM/SIGINT
+fn on_shutdown() -> int {
+    if g_changes_since_save > 0 {
+        let saved: int = kv_save(g_save_path)
+        print("[shutdown] saved " + int_to_string(saved) + " keys to " + g_save_path)
+    } else {
+        print("[shutdown] no pending changes, skipping save")
+    }
+    return 0
+}
+
+// TLS mode flag (set by --tls CLI arg)
+var g_tls_mode: int = 0
+
+// Global channel for dispatching client fds to workers
+var g_ch: Map = Map.new()
+
+// Read a RESP command over TLS
+fn resp_read_tls(ssl: int) -> Array {
+    let result: Array = []
+    let header: String = tls_read_line(ssl)
+    if header.length() == 0 { return result }
+    if header.charAt(0) != 42 {
+        if header.length() > 0 { return header.split(" ") }
+        return result
+    }
+    let count: int = string_to_int(header.substring(1, header.length()))
+    if count <= 0 { return result }
+    var i: int = 0
+    while i < count {
+        let bh: String = tls_read_line(ssl)
+        if bh.length() == 0 { return [] }
+        if bh.charAt(0) != 36 { return [] }
+        let data: String = tls_read_line(ssl)
+        result.push(data)
+        i = i + 1
+    }
+    return result
+}
+
+// TLS worker
+fn kv_tls_worker() -> int {
+    while 1 > 0 {
+        let fd: int = channel_recv(g_ch)
+        if fd < 0 { return 0 }
+
+        let ssl: int = tls_accept(fd)
+        if ssl == 0 {
+            tcp_close(fd)
+        } else {
+            g_connections = g_connections + 1
+            var connected: bool = true
+            while connected {
+                let cmd: Array = resp_read_tls(ssl)
+                if cmd.length() == 0 {
+                    connected = false
+                } else {
+                    let response: String = dispatch_command(cmd, fd)
+                    if response == "__SUBSCRIBE__" {
+                        tls_write_conn(ssl, resp_error("SUBSCRIBE not supported over TLS"))
+                        connected = false
+                    } else if response.length() > 0 {
+                        tls_write_conn(ssl, response)
+                    }
+                }
+            }
+            pubsub_disconnect(fd)
+            auth_disconnect(fd)
+            tls_close_conn(ssl)
+        }
+    }
+    return 0
+}
+
+// Plain-TCP worker
+fn kv_worker() -> int {
+    while 1 > 0 {
+        let client: int = channel_recv(g_ch)
+        if client < 0 { return 0 }
+
+        g_connections = g_connections + 1
+
+        var connected: bool = true
+        while connected {
+            let cmd: Array = resp_read_command_fast(client)
+            if cmd.length() == 0 {
+                connected = false
+            } else {
+                let response: String = dispatch_command(cmd, client)
+                if response == "__SUBSCRIBE__" {
+                    pubsub_subscriber_loop(client)
+                } else if response.length() > 0 {
+                    tcp_write(client, response)
+                }
+            }
+        }
+        pubsub_disconnect(client)
+        auth_disconnect(client)
+        tcp_close(client)
+    }
+    return 0
+}
+
+fn main() {
+    var port: int = 6380
+    let num_workers: int = 128
+
+    // Parse CLI args
+    let args: Array = get_args()
+    var ai: int = 1
+    while ai < args.length() {
+        let arg: String = args[ai]
+        if arg == "--public" {
+            g_public_mode = 1
+        } else if arg == "--tls" {
+            g_tls_mode = 1
+        } else if arg == "--port" and ai + 1 < args.length() {
+            ai = ai + 1
+            let next: String = args[ai]
+            port = string_to_int(next)
+        }
+        ai = ai + 1
+    }
+
+    init_limits()
+    setup_shutdown_handler(on_shutdown)
+
+    // Restore from snapshot
+    if file_exists(g_save_path) {
+        let loaded: int = kv_load(g_save_path)
+        print("[restore] loaded " + int_to_string(loaded) + " keys from " + g_save_path)
+    }
+
+    if g_tls_mode == 1 {
+        let tls_cert: String = getenv_default("TLS_CERT", "/etc/letsencrypt/live/nyxkv.com/fullchain.pem")
+        let tls_key: String = getenv_default("TLS_KEY", "/etc/letsencrypt/live/nyxkv.com/privkey.pem")
+        let tls_ok: int = tls_server_init(tls_cert, tls_key)
+        if tls_ok < 0 {
+            print("ERROR: TLS init failed — check TLS_CERT/TLS_KEY env vars")
+            return 0
+        }
+        print("nyx-kv standalone (TLS mode)")
+    } else if g_public_mode == 1 {
+        print("nyx-kv standalone (public mode, free tier limits)")
+    } else {
+        print("nyx-kv standalone (private mode)")
+    }
+    print("Listening on port " + int_to_string(port))
+
+    g_ch = channel_new(512)
+    let server: int = tcp_listen("0.0.0.0", port)
+    if server < 0 {
+        print("ERROR: cannot listen on port " + int_to_string(port))
+        return 0
+    }
+
+    var i: int = 0
+    while i < num_workers {
+        if g_tls_mode == 1 {
+            thread_spawn(kv_tls_worker)
+        } else {
+            thread_spawn(kv_worker)
+        }
+        i = i + 1
+    }
+
+    thread_spawn(kv_bg_saver)
+    print("[persist] background saver enabled (save to " + g_save_path + ")")
+    print(int_to_string(num_workers) + " workers spawned, ready for connections...")
+
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            channel_send(g_ch, client)
+        }
+    }
+    return 0
+}

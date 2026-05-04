@@ -1,0 +1,15 @@
+[package]
+name = "nyx-kv"
+version = "0.3.2"
+main = "examples/standalone.nx"
+description = "Redis-compatible KV store library: 52 RESP2 commands, 4 data types, AUTH, Pub/Sub, persistence"
+
+# nyx-kv is consumed as a library by concrete KV service projects.
+# See services/nyxkv/ in the NyxLang monorepo for the production
+# consumer that adds --public / --tls / --port flag parsing, Let's
+# Encrypt cert wiring for nyxkv.com, and the background saver. Running
+# `nyx build` from this directory produces a plain RESP2 reference
+# binary built from examples/standalone.nx as a smoke test of the
+# library's public API.
+
+[dependencies]
