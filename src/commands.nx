@@ -1,0 +1,1752 @@
+// commands.nx — Command dispatch for nyx-kv
+// Receives parsed RESP command array, executes on store, returns RESP response
+// Returns "" if response was already written directly to fd.
+
+// Cached constant responses (avoid allocation per request)
+var RESP_OK: String = "+OK\r\n"
+var RESP_PONG: String = "+PONG\r\n"
+var RESP_NULL: String = "$-1\r\n"
+var RESP_ZERO: String = ":0\r\n"
+var RESP_ONE: String = ":1\r\n"
+var RESP_EMPTY_ARR: String = "*0\r\n"
+var RESP_WRONGTYPE: String = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+
+// Dispatch a parsed command and return the RESP response string.
+// All commands return the response as a string — the worker writes it to
+// the appropriate socket (plain fd or TLS SSL handle). An earlier version
+// had GET write directly to the raw fd as a "fast path", which broke TLS
+// completely; do not re-introduce that pattern.
+
+// is_int: valida que s sea un entero decimal (opcional '-' + al menos un dígito,
+// todos dígitos). Los args numéricos de comandos vienen del CLIENTE; string_to_int
+// hace exit(1) sobre no-numérico → un `EXPIRE k xx` o `SETEX k x v` tumbaría el
+// daemon entero (DoS remoto post-parse). Se valida ANTES de parsear y se devuelve
+// un error RESP en vez de crashear (como Redis: "value is not an integer").
+fn is_int(s: String) -> bool {
+    let n: int = s.length()
+    if n == 0 { return false }
+    var i: int = 0
+    if s.charAt(0) == 45 {        // '-' (negativos legítimos: LRANGE -1, etc.)
+        if n == 1 { return false }
+        i = 1
+    }
+    while i < n {
+        let c: int = s.charAt(i)
+        if c < 48 or c > 57 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Follow-up (d) del review kv↔Redis #1: TTLs negativos o gigantes pasaban en
+// silencio. is_int acepta cualquier largo y string_to_int DESBORDA i64 con
+// 19+ dígitos (un PXAT gigante se volvía expiración en el pasado → la key se
+// evaporaba); un EX/PX <= 0 expiraba inmediato sin aviso. Redis responde
+// "invalid expire time" / "not an integer or out of range". Llamar SOLO
+// después de que is_int pasó. Devuelve "" si el número es un expire válido,
+// o el error RESP a retornar. Para EXAT/PXAT un instante positivo en el
+// pasado sigue siendo válido (expiración inmediata legítima, como Redis);
+// negativo o cero no.
+fn check_expire_num(num_str: String, flag: String, cmd_name: String) -> String {
+    var digits: int = num_str.length()
+    if num_str.charAt(0) == 45 { digits = digits - 1 }
+    // i64 max = 9223372036854775807 (19 dígitos): >18 dígitos puede
+    // desbordar string_to_int — rechazar sin parsear (mismo error que da
+    // Redis cuando el parse a i64 falla).
+    if digits > 18 {
+        return resp_error("ERR value is not an integer or out of range")
+    }
+    // ttl_flag_to_exp_us MULTIPLICA (EX*1e6, PX/PXAT*1e3, EXAT*1e6): un
+    // número que entra en i64 igual puede desbordar en la conversión a us
+    // (expiración en el pasado → key evaporada). Cap de dígitos por flag,
+    // holgado para cualquier uso real (EX 1e10 s ~ 317 años; PXAT 1e15 ms
+    // ~ año 33658) pero que garantiza que la multiplicación no desborda.
+    var max_digits: int = 10
+    if flag == "PX" { max_digits = 13 }
+    if flag == "EXAT" { max_digits = 12 }
+    if flag == "PXAT" { max_digits = 15 }
+    let num: int = string_to_int(num_str)
+    if digits > max_digits or num <= 0 {
+        return resp_error("ERR invalid expire time in '" + cmd_name + "' command")
+    }
+    return ""
+}
+
+// TTL del free tier sobre una clave recién escrita. Se aplica SOLO si el daemon
+// corre en modo público Y el plan del cliente lo exige (auth_force_ttl devuelve
+// false para pro/enterprise).
+//
+// POR QUÉ EXISTE ESTE HELPER: la condición estaba repetida en los 7 puntos de
+// escritura (SET, MSET, RPUSH, ...) como "if g_public_mode == 1 { enforce_ttl(key) }",
+// SIN consultar el plan. auth_force_ttl estaba escrita justo para esto y no se
+// llamaba desde ningún sitio: era código muerto. Resultado: TODA clave expiraba a
+// las 24 h, también las de los tokens enterprise — precisamente lo que un plan de
+// pago promete que no pasa. La pérdida era silenciosa y recurrente
+// (venezuelainfo.org perdió su guía Baquiano y su chat cada 24 h desde el
+// despliegue inicial; se diagnosticó como "leak/crash del daemon" y se parchearon
+// los síntomas). Centralizado aquí para que la política viva en UN sitio y no
+// pueda volver a divergir de auth_force_ttl.
+// is_memory_key: true si la key (posiblemente namespaceada "user_id::mem:...",
+// o anonima "mem:...") pertenece al Agent Memory SDK (prefijo "mem:"). La
+// memoria de agentes AI no debe expirar por la politica de TTL forzado del
+// free tier (incidente 2026-07-20: mem:* de usuarios free perdia datos a
+// diario). Supuesto documentado: el namespace user_id es ASCII sin '::' en
+// medio (lo genera auth_create_token/TOKEN_CREATE, no el cliente), asi que
+// indexOf alcanza — no hace falta un scanner byte-a-byte.
+fn is_memory_key(key: String) -> bool {
+    let sep: int = key.indexOf("::")
+    if sep >= 0 {
+        let remainder: String = key.substring(sep + 2, key.length())
+        return remainder.startsWith("mem:")
+    }
+    return key.startsWith("mem:")
+}
+
+// Computes an absolute expiration stamp on the MONOTONIC clock (microseconds
+// since boot, the domain g_ttl lives in — NOT epoch) from
+// a Redis-style TTL flag: EX <seconds> | PX <ms> | EXAT <unix-seconds> |
+// PXAT <unix-ms>. Shared by SET's inline flags and GETEX — both need
+// millisecond precision (PX/PXAT), which kv_expire (relative seconds only)
+// can't give; g_ttl itself already stores microseconds (see store.nx), so
+// this just does the unit math once instead of duplicating it per caller.
+// EX is capped in public mode to match SETEX/EXPIRE's free-tier ceiling.
+// EXAT/PXAT are ALSO capped in public mode (review fix): an absolute instant
+// is exactly as attacker-controlled as a duration — `SET k v EXAT
+// 99999999999` is just `EX <huge>` spelled differently, and cap_ttl only
+// caps relative seconds, so it was a free-tier bypass. Clamp to
+// now + MAX_TTL_SECONDS when the requested instant is further out than that.
+fn ttl_flag_to_exp_us(flag: String, num: int) -> int {
+    if flag == "EX" {
+        var seconds: int = num
+        if g_public_mode == 1 { seconds = cap_ttl(seconds) }
+        return time_us() + seconds * 1000000
+    }
+    if flag == "PX" {
+        var exp_us_px: int = time_us() + num * 1000
+        if g_public_mode == 1 {
+            let max_exp_us_px: int = time_us() + MAX_TTL_SECONDS * 1000000
+            if exp_us_px > max_exp_us_px { exp_us_px = max_exp_us_px }
+        }
+        return exp_us_px
+    }
+    // EXAT/PXAT traen un instante ABSOLUTO en epoch (segundos o ms) elegido por
+    // el cliente. `g_ttl` NO vive en ese dominio: se compara siempre contra
+    // `time_us()`, que es `os_monotonic_ns()/1000` — microsegundos desde el
+    // ARRANQUE de la maquina, no desde epoch. Guardar el epoch crudo, como se
+    // hacia hasta el 2026-09-10, ponia en g_ttl un numero de ~1.7e15 us frente
+    // a un uptime de a lo sumo ~1e13 us: `kv_check_expired` nunca llegaba a
+    // alcanzarlo y **la key no expiraba jamas**. Sintoma visible: `TTL k`
+    // reportaba ~55 anios de vida restante.
+    //
+    // No se arregla pasando g_ttl a epoch: es monotonico A PROPOSITO, para que
+    // un ajuste de NTP o un cambio manual de hora no evapore ni inmortalice las
+    // keys vivas. Lo que se convierte es la ENTRADA: el instante epoch se pasa
+    // a un delta y ese delta se suma al reloj monotonico.
+    var delta_us: int = 0
+    if flag == "EXAT" {
+        delta_us = (num - time_epoch()) * 1000000
+    } else {
+        delta_us = num * 1000 - time_epoch() * 1000000
+    }
+    var exp_us: int = time_us() + delta_us
+    if g_public_mode == 1 {
+        let max_exp_us: int = time_us() + MAX_TTL_SECONDS * 1000000
+        if exp_us > max_exp_us { exp_us = max_exp_us }
+    }
+    // Un instante en el PASADO es legitimo y significa "expira ya" (semantica de
+    // Redis, ya documentada arriba en check_expire_num). Pero `kv_check_expired`
+    // guarda con `if exp > 0`: un exp_us negativo o cero cae fuera de ese if y la
+    // key quedaria inmortal — el bug de arriba al reves. El piso de 1 us la deja
+    // dentro del guard y vencida desde el primer chequeo.
+    if exp_us < 1 { exp_us = 1 }
+    return exp_us
+}
+
+fn maybe_enforce_ttl(key: String, fd: int) {
+    if g_public_mode == 1 and auth_force_ttl(fd) {
+        if is_memory_key(key) { return }
+        enforce_ttl(key)
+    }
+}
+
+// tenant_visible_keys: el keyspace visible para fd, con el mismo filtro y
+// stripping de namespace que KEYS (commands.nx, comando KEYS de mas abajo).
+// Autenticado -> solo keys "user_id::..." de SU tenant, prefijo quitado;
+// anonimo -> solo keys SIN "::"; modo no-publico -> todas (sin concepto de
+// tenant). Extraido a un solo lugar para que el aislamiento entre tenants
+// (KEYS y SCAN, Task 5) no pueda desincronizarse entre dos copias del mismo
+// filtro (KEYS ya duplicaba esta logica; SCAN la necesita identica).
+fn tenant_visible_keys(fd: int) -> Array {
+    let keys: Array = kv_keys()
+    if g_public_mode != 1 {
+        return keys
+    }
+    let filtered: Array = []
+    var ki: int = 0
+    let user_id: String = auth_get_user(fd)
+    if user_id.length() > 0 {
+        let prefix: String = user_id + "::"
+        let prefix_len: int = prefix.length()
+        while ki < keys.length() {
+            let k: String = keys[ki]
+            if k.length() >= prefix_len {
+                let kp: String = k.substring(0, prefix_len)
+                if kp == prefix {
+                    filtered.push(k.substring(prefix_len, k.length()))
+                }
+            }
+            ki = ki + 1
+        }
+    } else {
+        while ki < keys.length() {
+            let k: String = keys[ki]
+            if k.indexOf("::") < 0 {
+                filtered.push(k)
+            }
+            ki = ki + 1
+        }
+    }
+    return filtered
+}
+
+// glob_match: subset de patrones estilo Redis MATCH — '*' (0+ bytes) y '?'
+// (exactamente 1 byte). NO soporta clases [...] ni escapes '\' (P1,
+// catalogado — el caso de uso dominante de scan_iter()/ORMs es el prefijo
+// "algo:*", que SI cubre). Backtracking iterativo clasico de wildcard
+// matching (sin recursion, O(pattern+key) amortizado). Opera byte a byte
+// (charAt) — consistente con el contrato strings=bytes del lenguaje; una
+// key/patron con codepoints multi-byte matchea por BYTE, no por
+// codepoint (mismo supuesto que is_memory_key: nombres de key son texto
+// ASCII/UTF-8 sin necesidad de alinear a codepoint para MATCH).
+fn glob_match(pattern: String, s: String) -> bool {
+    let pn: int = pattern.length()
+    let sn: int = s.length()
+    var pi: int = 0
+    var si: int = 0
+    var star_pi: int = 0 - 1
+    var star_si: int = 0 - 1
+    while si < sn {
+        var advanced: bool = false
+        if pi < pn {
+            let pc: int = pattern.charAt(pi)
+            if pc == 42 {                      // '*'
+                star_pi = pi
+                star_si = si
+                pi = pi + 1
+                advanced = true
+            } else if pc == 63 or pc == s.charAt(si) {   // '?' or literal byte match
+                pi = pi + 1
+                si = si + 1
+                advanced = true
+            }
+        }
+        if advanced == false {
+            if star_pi >= 0 {
+                pi = star_pi + 1
+                star_si = star_si + 1
+                si = star_si
+            } else {
+                return false
+            }
+        }
+    }
+    while pi < pn and pattern.charAt(pi) == 42 {
+        pi = pi + 1
+    }
+    return pi == pn
+}
+
+// resp_scan_reply: serializa la respuesta de dos elementos de SCAN
+// (`[next_cursor_string, [keys...]]`) — no vive en std/resp (toolchain
+// externo, ver CLAUDE.md de este repo: "std/resp" resuelve al stdlib del
+// lenguaje en NYX_HOME, no a un archivo de este repo) porque SCAN es un
+// formato de respuesta propio de nyx-kv, no del protocolo RESP generico.
+fn resp_scan_reply(cursor: String, keys: Array) -> String {
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append("*2\r\n")
+    sb.append("$")
+    sb.append(int_to_string(cursor.length()))
+    sb.append("\r\n")
+    sb.append(cursor)
+    sb.append("\r\n")
+    sb.append("*")
+    sb.append(int_to_string(keys.length()))
+    sb.append("\r\n")
+    for k: String in keys {
+        sb.append("$")
+        sb.append(int_to_string(k.length()))
+        sb.append("\r\n")
+        sb.append(k)
+        sb.append("\r\n")
+    }
+    return sb.to_string()
+}
+
+// handle/is_tls (Task 2): identidad de transporte para pub/sub — is_tls=0 →
+// handle == fd (mismo fd de kernel); is_tls=1 → handle es el SSL handle de
+// tls_accept, DISTINTO de fd (fd sigue siendo el fd de kernel, usado acá
+// solo para rate-limit/auth por IP). SUBSCRIBE/UNSUBSCRIBE son los únicos
+// comandos que tocan handle/is_tls — el resto de dispatch_command los ignora.
+fn dispatch_command(cmd: Array, fd: int, handle: int, is_tls: int) -> String {
+    if cmd.length() == 0 {
+        return resp_error("empty command")
+    }
+
+    // Rate limiting (only in public mode)
+    if g_public_mode == 1 {
+        let ip: String = get_client_ip(fd)
+        let rl: String = check_rate_limit(ip)
+        if rl.length() > 0 { return rl }
+    }
+
+    let raw: String = cmd[0]
+    // Guard against an empty command verb (e.g. RESP "*1\r\n$0\r\n\r\n", or a
+    // client that connects and disconnects). Without this, raw.charAt(0) below
+    // crashes the whole daemon — a public-host DoS via empty/malformed input.
+    if raw.length() == 0 {
+        return resp_error("ERR empty command")
+    }
+
+    // Handle AUTH before namespace prefixing
+    if raw == "AUTH" or raw == "auth" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'AUTH' command")
+        }
+        let token: String = cmd[1]
+        return auth_login(fd, token)
+    }
+
+    // Handle WHOAMI
+    if raw == "WHOAMI" or raw == "whoami" {
+        let info: String = auth_whoami(fd)
+        return resp_bulk_string(info)
+    }
+
+    // Handle TOKEN_CREATE (admin only, localhost)
+    // Syntax: TOKEN_CREATE user plan [ttl_seconds]
+    if raw == "TOKEN_CREATE" or raw == "token_create" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'TOKEN_CREATE' command")
+        }
+        let user_id: String = cmd[1]
+        let plan: String = cmd[2]
+        var ttl: int = 0
+        if cmd.length() >= 4 {
+            let ttl_arg: String = cmd[3]
+            if !is_int(ttl_arg) { return resp_error("value is not an integer or out of range") }
+            ttl = string_to_int(ttl_arg)
+        }
+        let token: String = auth_create_token(fd, user_id, plan, ttl)
+        if token.length() == 0 {
+            return resp_error("TOKEN_CREATE failed (localhost only, valid plans: free/pro/enterprise)")
+        }
+        return resp_bulk_string(token)
+    }
+
+    // Handle TOKEN_REVOKE (admin only, localhost)
+    if raw == "TOKEN_REVOKE" or raw == "token_revoke" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TOKEN_REVOKE' command")
+        }
+        let revoke_token: String = cmd[1]
+        let ok: bool = auth_revoke_token(fd, revoke_token)
+        if ok == false {
+            return resp_error("TOKEN_REVOKE failed (localhost only or token not found)")
+        }
+        return RESP_OK
+    }
+
+    // Handle TOKEN_LIST (admin only, localhost)
+    if raw == "TOKEN_LIST" or raw == "token_list" {
+        return auth_list_tokens(fd)
+    }
+
+    // Namespace prefixing: transparently prefix keys with user_id::
+    // Applied to all key-bearing commands for authenticated users
+    if g_public_mode == 1 {
+        let user_id: String = auth_get_user(fd)
+        if user_id.length() > 0 {
+            let upper: String = raw.toUpper()
+            // Commands with key at position 1
+            if upper == "SET" or upper == "GET" or upper == "DEL" or upper == "EXISTS" or upper == "EXPIRE" or upper == "TTL" or upper == "PERSIST" or upper == "INCR" or upper == "DECR" or upper == "INCRBY" or upper == "DECRBY" or upper == "TYPE" or upper == "SETNX" or upper == "SETEX" or upper == "APPEND" or upper == "STRLEN" or upper == "GETSET" or upper == "GETDEL" or upper == "GETEX" or upper == "LPUSH" or upper == "RPUSH" or upper == "LPOP" or upper == "RPOP" or upper == "LLEN" or upper == "LRANGE" or upper == "LINDEX" or upper == "SADD" or upper == "SREM" or upper == "SISMEMBER" or upper == "SMEMBERS" or upper == "SCARD" or upper == "HSET" or upper == "HGET" or upper == "HDEL" or upper == "HGETALL" or upper == "HKEYS" or upper == "HVALS" or upper == "HEXISTS" or upper == "HLEN" {
+                if cmd.length() >= 2 {
+                    let orig_key: String = cmd[1]
+                    cmd[1] = user_id + "::" + orig_key
+                }
+            }
+            // MSET: keys at positions 1, 3, 5, ...
+            if upper == "MSET" {
+                var mi: int = 1
+                while mi < cmd.length() {
+                    let orig_key: String = cmd[mi]
+                    cmd[mi] = user_id + "::" + orig_key
+                    mi = mi + 2
+                }
+            }
+            // MGET: keys at positions 1, 2, 3, ...
+            if upper == "MGET" {
+                var mi: int = 1
+                while mi < cmd.length() {
+                    let orig_key: String = cmd[mi]
+                    cmd[mi] = user_id + "::" + orig_key
+                    mi = mi + 1
+                }
+            }
+            // DEL with multiple keys
+            if upper == "DEL" and cmd.length() > 2 {
+                var di: int = 2
+                while di < cmd.length() {
+                    let orig_key: String = cmd[di]
+                    cmd[di] = user_id + "::" + orig_key
+                    di = di + 1
+                }
+            }
+        } else {
+            // Anonymous in public mode: block access to namespaced keys (containing ::)
+            if cmd.length() >= 2 {
+                let anon_key: String = cmd[1]
+                let anon_sep: int = anon_key.indexOf("::")
+                if anon_sep >= 0 {
+                    return resp_error("access denied: cannot access namespaced keys")
+                }
+            }
+        }
+    }
+
+    let first: int = raw.charAt(0)
+
+    // === Fast path: SET (S=83, s=115) — ~50% of benchmark traffic ===
+    if first == 83 or first == 115 {
+        if raw == "SET" or raw == "set" {
+            if cmd.length() < 3 {
+                return resp_error("wrong number of arguments for 'SET' command")
+            }
+            let key: String = cmd[1]
+            let value: String = cmd[2]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                let ip: String = get_client_ip(fd)
+                let kl: String = check_key_limit(ip, key)
+                if kl.length() > 0 { return kl }
+            }
+            if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+
+            // Plain `SET key value` (2 args) — the benchmark-critical path,
+            // kept byte-for-byte as before. Anything with extra tokens (NX/
+            // XX/EX/PX/EXAT/PXAT/GET) falls through to the flag parser below
+            // instead, so this branch never pays for parsing it doesn't need.
+            if cmd.length() == 3 {
+                g_store.insert(key, value)
+                if g_ttl.size() > 0 {
+                    if g_ttl.contains(key) { g_ttl.remove(key) }
+                }
+                g_ops_total = g_ops_total + 1
+                g_changes_since_save = g_changes_since_save + 1
+                maybe_enforce_ttl(key, fd)
+                return RESP_OK
+            }
+
+            // SET key value [NX|XX] [EX s|PX ms|EXAT ts|PXAT ts] [GET]
+            var use_nx: bool = false
+            var use_xx: bool = false
+            var use_get: bool = false
+            var has_ttl: bool = false
+            var exp_us: int = 0
+            var i: int = 3
+            while i < cmd.length() {
+                let flag_raw: String = cmd[i]
+                let flag: String = flag_raw.toUpper()
+                if flag == "NX" {
+                    use_nx = true
+                    i = i + 1
+                } else if flag == "XX" {
+                    use_xx = true
+                    i = i + 1
+                } else if flag == "GET" {
+                    use_get = true
+                    i = i + 1
+                } else if flag == "EX" or flag == "PX" or flag == "EXAT" or flag == "PXAT" {
+                    if i + 1 >= cmd.length() { return resp_error("ERR syntax error") }
+                    let num_str: String = cmd[i + 1]
+                    if !is_int(num_str) { return resp_error("ERR value is not an integer or out of range") }
+                    let expire_err: String = check_expire_num(num_str, flag, "set")
+                    if expire_err.length() > 0 { return expire_err }
+                    let num: int = string_to_int(num_str)
+                    has_ttl = true
+                    exp_us = ttl_flag_to_exp_us(flag, num)
+                    i = i + 2
+                } else {
+                    return resp_error("ERR syntax error")
+                }
+            }
+            if use_nx and use_xx { return resp_error("ERR syntax error") }
+
+            let existed: int = kv_exists(key)
+            var old_val: String = ""
+            if use_get { old_val = kv_get(key) }
+
+            var should_set: bool = true
+            if use_nx and existed == 1 { should_set = false }
+            if use_xx and existed == 0 { should_set = false }
+
+            if should_set {
+                g_store.insert(key, value)
+                if g_ttl.size() > 0 {
+                    if g_ttl.contains(key) { g_ttl.remove(key) }
+                }
+                g_ops_total = g_ops_total + 1
+                g_changes_since_save = g_changes_since_save + 1
+                if has_ttl {
+                    kv_expire_at_us(key, exp_us)
+                    // UN comando SET (el +1 de arriba); kv_expire_at_us
+                    // suma otro → compensar (follow-up (g) del review).
+                    g_ops_total = g_ops_total - 1
+                } else {
+                    maybe_enforce_ttl(key, fd)
+                }
+            }
+
+            if use_get {
+                if existed == 0 { return RESP_NULL }
+                return resp_bulk_string(old_val)
+            }
+            if should_set == false { return RESP_NULL }
+            return RESP_OK
+        }
+    }
+
+    // === Fast path: GET (G=71, g=103) — ~50% of benchmark traffic ===
+    if first == 71 or first == 103 {
+        if raw == "GET" or raw == "get" {
+            if cmd.length() < 2 {
+                return resp_error("wrong number of arguments for 'GET' command")
+            }
+            let key: String = cmd[1]
+            if g_ttl.size() > 0 { kv_check_expired(key) }
+            g_ops_total = g_ops_total + 1
+            if g_store.contains(key) == false {
+                return RESP_NULL
+            }
+            let val: String = g_store.get(key)
+            // NOTE: an earlier "fast path" wrote the bulk string directly to
+            // the raw fd via resp_write_bulk(fd, val) and returned "". That
+            // bypassed the TLS worker (which writes to the SSL handle, not
+            // the raw socket) and made every TLS GET silently lose its
+            // response. Returning the bulk string here costs one allocation
+            // per GET but works uniformly across plain TCP and TLS workers.
+            return resp_bulk_string(val)
+        }
+    }
+
+    // === Fast path: PING (P=80, p=112) ===
+    if first == 80 or first == 112 {
+        if raw == "PING" or raw == "ping" {
+            if cmd.length() > 1 {
+                let msg: String = cmd[1]
+                return resp_bulk_string(msg)
+            }
+            return RESP_PONG
+        }
+    }
+
+    // === Slow path: toUpper for all other commands ===
+    let name: String = raw.toUpper()
+
+    // DEL key [key ...]
+    if name == "DEL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'DEL' command")
+        }
+        var deleted: int = 0
+        var i: int = 1
+        while i < cmd.length() {
+            let key: String = cmd[i]
+            let d: int = kv_del(key)
+            if d == 1 and g_public_mode == 1 { track_key_delete(get_client_ip(fd)) }
+            deleted = deleted + d
+            i = i + 1
+        }
+        return resp_integer(deleted)
+    }
+
+    // EXISTS key
+    if name == "EXISTS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'EXISTS' command")
+        }
+        let key: String = cmd[1]
+        let ex: int = kv_exists(key)
+        if ex == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // KEYS * — capado a 100 en modo publico y SIN cursor: para datasets
+    // >100 se pierden keys en silencio. SCAN (mas abajo) es el reemplazo
+    // recomendado para produccion (scan_iter() de redis-py/ORMs); KEYS
+    // queda por compat con clientes que lo esperan para datasets chicos.
+    if name == "KEYS" {
+        let filtered: Array = tenant_visible_keys(fd)
+        if g_public_mode == 1 and filtered.length() > 100 {
+            let limited: Array = []
+            var ki: int = 0
+            while ki < 100 {
+                limited.push(filtered[ki])
+                ki = ki + 1
+            }
+            return resp_bulk_array(limited)
+        }
+        return resp_bulk_array(filtered)
+    }
+
+    // SCAN cursor [MATCH pattern] [COUNT n] — iteracion no bloqueante del
+    // keyspace del tenant (mismo aislamiento que KEYS via
+    // tenant_visible_keys). Responde un array RESP de 2 elementos:
+    // [next_cursor_string, [keys...]]. cursor "0" inicia una iteracion;
+    // next_cursor "0" marca el fin.
+    //
+    // GARANTIA DE CONSISTENCIA (documentada — ver kv-t5-report.md para el
+    // detalle): cursor = OFFSET en tenant_visible_keys(fd), que internamente
+    // concatena kv_keys() (g_store/g_lists/g_sets/g_hashes en ese orden) ya
+    // filtrado/stripeado por tenant. Verificado EMPIRICAMENTE
+    // (probe_map_stability.nx) que Map.keys() devuelve el MISMO orden en
+    // llamadas consecutivas sin escrituras -> SIN escrituras concurrentes
+    // entre llamadas SCAN sucesivas, un scan completo (cursor 0 hasta
+    // next_cursor "0") visita cada key EXACTAMENTE una vez (ni falta ni
+    // duplica).
+    //
+    // CON escrituras concurrentes el modo de fallo REAL es peor que un
+    // simple "DELETE localizado saltea una key vecina": g_store (y
+    // g_lists/g_sets/g_hashes) son Maps COMPARTIDOS por TODOS los tenants,
+    // no uno por tenant. Un insert de CUALQUIER tenant que cruce el load
+    // factor dispara nyx_map_resize (runtime/maps.c) -> reordena
+    // GLOBALMENTE la enumeracion que kv_keys() expone. Si eso ocurre entre
+    // dos paginas del scan de tenant A, el offset de A queda invalidado
+    // ENTERO para el resto de la iteracion: no es un salteo localizado
+    // alrededor del punto de escritura, es miss/dup NO ACOTADO en
+    // cualquier parte de las paginas restantes — un insert de un tenant B
+    // completamente ajeno puede romper un scan de A en curso. Esto viola
+    // INCLUSO la garantia debil de Redis ("una key presente durante TODO
+    // el scan aparece >=1 vez"): con un resize de por medio, esa key puede
+    // perderse sin haber sido tocada. No mitigado en esta iteracion (P1:
+    // cursor de snapshot ordenado, opcion B del brief, es el upgrade que
+    // lo resuelve — copia el orden al iniciar el scan en vez de leer el
+    // Map compartido en cada pagina).
+    if name == "SCAN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SCAN' command")
+        }
+        let cursor_str: String = cmd[1]
+        if !is_int(cursor_str) { return resp_error("invalid cursor") }
+        let cursor: int = string_to_int(cursor_str)
+        if cursor < 0 { return resp_error("invalid cursor") }
+
+        var pattern: String = ""
+        var has_match: bool = false
+        var count: int = 10
+        var oi: int = 2
+        while oi < cmd.length() {
+            // Gotcha catalogado (PROJECT_STATE.md): arr[i] inline en una
+            // llamada de metodo/reasignacion de var genera IR malformado —
+            // bindear en un let tipado primero.
+            let opt_raw: String = cmd[oi]
+            let opt: String = opt_raw.toUpper()
+            if opt == "MATCH" {
+                if oi + 1 >= cmd.length() { return resp_error("syntax error") }
+                let match_arg: String = cmd[oi + 1]
+                pattern = match_arg
+                has_match = true
+                oi = oi + 2
+            } else if opt == "COUNT" {
+                if oi + 1 >= cmd.length() { return resp_error("syntax error") }
+                let c_str: String = cmd[oi + 1]
+                if !is_int(c_str) { return resp_error("value is not an integer or out of range") }
+                count = string_to_int(c_str)
+                if count <= 0 { count = 10 }
+                oi = oi + 2
+            } else {
+                return resp_error("syntax error")
+            }
+        }
+
+        // SCAN cursor-ESTABLE (map_scan del core — FASE B 2026-07-21): el
+        // cursor RESP codifica fase + cursor del Map (map_cursor*4 + fase;
+        // fases: 0=strings 1=lists 2=sets 3=hashes). Garantía Redis REAL:
+        // una key presente durante todo el scan aparece >= 1 vez aunque
+        // CUALQUIER tenant dispare un resize a mitad (el diseño anterior —
+        // cursor = offset sobre kv_keys() materializado — daba duplicados/
+        // faltantes arbitrarios tras un resize; ver kv-t5-report.md).
+        // COUNT: se procesan páginas (buckets) enteras hasta juntar >=count,
+        // como Redis (puede devolver algo más que count).
+        let user_id: String = auth_get_user(fd)
+        var vis_prefix: String = ""
+        if g_public_mode == 1 and user_id.length() > 0 {
+            vis_prefix = user_id + "::"
+        }
+        let vp_len: int = vis_prefix.length()
+        var phase: int = cursor % 4
+        var mcur: int = cursor / 4
+        let batch: Array = []
+        var done: bool = false
+        var guard: int = 0
+        while not done and batch.length() < count and guard < 65536 {
+            let page: Array = kv_scan_page(phase, mcur)
+            let nc: int = page[0]
+            var pi: int = 1
+            while pi < page.length() {
+                let k: String = page[pi]
+                var visible_k: String = ""
+                var is_vis: bool = false
+                if g_public_mode != 1 {
+                    visible_k = k
+                    is_vis = true
+                } else if vp_len > 0 {
+                    if k.length() >= vp_len {
+                        if k.substring(0, vp_len) == vis_prefix {
+                            visible_k = k.substring(vp_len, k.length())
+                            is_vis = true
+                        }
+                    }
+                } else {
+                    if k.indexOf("::") < 0 {
+                        visible_k = k
+                        is_vis = true
+                    }
+                }
+                if is_vis {
+                    if has_match == false or glob_match(pattern, visible_k) {
+                        batch.push(visible_k)
+                    }
+                }
+                pi = pi + 1
+            }
+            if nc == 0 {
+                phase = phase + 1
+                mcur = 0
+                if phase > 3 { done = true }
+            } else {
+                mcur = nc
+            }
+            guard = guard + 1
+        }
+        var next_cursor: String = "0"
+        if not done { next_cursor = int_to_string(mcur * 4 + phase) }
+        return resp_scan_reply(next_cursor, batch)
+    }
+
+    // EXPIRE key seconds [NX|XX|GT|LT]
+    if name == "EXPIRE" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'EXPIRE' command")
+        }
+        let key: String = cmd[1]
+        let sec_str: String = cmd[2]
+        if !is_int(sec_str) { return resp_error("value is not an integer or out of range") }
+        // EXPIRE con seconds <= 0 es VÁLIDO en Redis (borra la key) — acá
+        // solo se guarda el overflow de 19+ dígitos (follow-up (d)).
+        var sec_digits: int = sec_str.length()
+        if sec_str.charAt(0) == 45 { sec_digits = sec_digits - 1 }
+        if sec_digits > 18 { return resp_error("ERR value is not an integer or out of range") }
+        var seconds: int = string_to_int(sec_str)
+        if g_public_mode == 1 { seconds = cap_ttl(seconds) }
+        if cmd.length() > 3 {
+            // Exactly one flag token — reject trailing garbage instead of
+            // silently ignoring it (`EXPIRE k 50 NX GARBAGE` must error, as
+            // in Redis).
+            if cmd.length() > 4 { return resp_error("ERR syntax error") }
+            let flag_raw: String = cmd[3]
+            let flag: String = flag_raw.toUpper()
+            // Redis 7 semantics: compare against the CURRENT ttl (kv_ttl:
+            // remaining seconds, -1 = no ttl / persists forever, -2 = no key).
+            let cur_ttl: int = kv_ttl(key)
+            if cur_ttl == (0 - 2) { return RESP_ZERO }
+            if flag == "NX" {
+                if cur_ttl != (0 - 1) { return RESP_ZERO }
+            } else if flag == "XX" {
+                if cur_ttl == (0 - 1) { return RESP_ZERO }
+            } else if flag == "GT" {
+                // No ttl == infinite: nothing is ever > infinite.
+                if cur_ttl == (0 - 1) { return RESP_ZERO }
+                if seconds <= cur_ttl { return RESP_ZERO }
+            } else if flag == "LT" {
+                // No ttl == infinite: any finite ttl is < infinite, so LT
+                // always applies when the key currently has no expiry.
+                if cur_ttl != (0 - 1) {
+                    if seconds >= cur_ttl { return RESP_ZERO }
+                }
+            } else {
+                return resp_error("ERR syntax error")
+            }
+        }
+        return resp_integer(kv_expire(key, seconds))
+    }
+
+    // TTL key
+    if name == "TTL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TTL' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_ttl(key))
+    }
+
+    // PERSIST key
+    if name == "PERSIST" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'PERSIST' command")
+        }
+        let key: String = cmd[1]
+        // Cierre del escape de política (follow-up (c) del review, decisión
+        // Ottavio 2026-07-21): un tenant con TTL forzado (free/anónimo en
+        // modo público) podía QUITARSE el TTL de 24h sin re-escribir la key.
+        // Las keys mem:* ya están exentas del TTL forzado → PERSIST sobre
+        // ellas sigue permitido (no escapa nada).
+        if g_public_mode == 1 and auth_force_ttl(fd) and !is_memory_key(key) {
+            return resp_error("PERSIST disabled in free tier")
+        }
+        return resp_integer(kv_persist(key))
+    }
+
+    // INCR key
+    if name == "INCR" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'INCR' command")
+        }
+        let key: String = cmd[1]
+        if g_ttl.size() > 0 { kv_check_expired(key) }
+        if g_store.contains(key) and !is_int(g_store.get(key)) {
+            return resp_error("value is not an integer or out of range")
+        }
+        return resp_integer(kv_incr(key))
+    }
+
+    // DECR key
+    if name == "DECR" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'DECR' command")
+        }
+        let key: String = cmd[1]
+        if g_ttl.size() > 0 { kv_check_expired(key) }
+        if g_store.contains(key) and !is_int(g_store.get(key)) {
+            return resp_error("value is not an integer or out of range")
+        }
+        return resp_integer(kv_decr(key))
+    }
+
+    // INCRBY key delta
+    if name == "INCRBY" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'INCRBY' command")
+        }
+        let key: String = cmd[1]
+        let delta_str: String = cmd[2]
+        if !is_int(delta_str) { return resp_error("value is not an integer or out of range") }
+        let delta: int = string_to_int(delta_str)
+        if g_ttl.size() > 0 { kv_check_expired(key) }
+        if g_store.contains(key) and !is_int(g_store.get(key)) {
+            return resp_error("value is not an integer or out of range")
+        }
+        return resp_integer(kv_incrby(key, delta))
+    }
+
+    // DECRBY key delta
+    if name == "DECRBY" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'DECRBY' command")
+        }
+        let key: String = cmd[1]
+        let delta_str: String = cmd[2]
+        if !is_int(delta_str) { return resp_error("value is not an integer or out of range") }
+        let delta: int = string_to_int(delta_str)
+        if g_ttl.size() > 0 { kv_check_expired(key) }
+        if g_store.contains(key) and !is_int(g_store.get(key)) {
+            return resp_error("value is not an integer or out of range")
+        }
+        return resp_integer(kv_decrby(key, delta))
+    }
+
+    // MSET k1 v1 k2 v2 ...
+    if name == "MSET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'MSET' command")
+        }
+        var i: int = 1
+        while i + 1 < cmd.length() {
+            let key: String = cmd[i]
+            let value: String = cmd[i + 1]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                let ip: String = get_client_ip(fd)
+                let kl: String = check_key_limit(ip, key)
+                if kl.length() > 0 { return kl }
+            }
+            kv_set(key, value)
+            maybe_enforce_ttl(key, fd)
+            i = i + 2
+        }
+        return RESP_OK
+    }
+
+    // MGET k1 k2 ...
+    if name == "MGET" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'MGET' command")
+        }
+        let values: Array = []
+        let flags: Array = []
+        var i: int = 1
+        while i < cmd.length() {
+            let key: String = cmd[i]
+            if kv_exists(key) == 1 {
+                values.push(kv_get(key))
+                flags.push(1)
+            } else {
+                values.push("")
+                flags.push(0)
+            }
+            i = i + 1
+        }
+        return resp_mixed_array(values, flags)
+    }
+
+    // DBSIZE
+    if name == "DBSIZE" {
+        if g_public_mode == 1 {
+            let user_id: String = auth_get_user(fd)
+            if user_id.length() > 0 {
+                // Count only keys in user's namespace
+                let keys: Array = kv_keys()
+                let prefix: String = user_id + "::"
+                let prefix_len: int = prefix.length()
+                var count: int = 0
+                var di: int = 0
+                while di < keys.length() {
+                    let k: String = keys[di]
+                    if k.length() >= prefix_len {
+                        let kp: String = k.substring(0, prefix_len)
+                        if kp == prefix { count = count + 1 }
+                    }
+                    di = di + 1
+                }
+                return resp_integer(count)
+            } else {
+                // Anonymous: count only non-namespaced keys
+                let keys: Array = kv_keys()
+                var count: int = 0
+                var di: int = 0
+                while di < keys.length() {
+                    let k: String = keys[di]
+                    let sep: int = k.indexOf("::")
+                    if sep < 0 { count = count + 1 }
+                    di = di + 1
+                }
+                return resp_integer(count)
+            }
+        }
+        return resp_integer(kv_dbsize())
+    }
+
+    // FLUSHDB
+    if name == "FLUSHDB" {
+        if g_public_mode == 1 { return is_command_disabled("FLUSHDB") }
+        kv_flushdb()
+        return RESP_OK
+    }
+
+    // INFO
+    if name == "INFO" {
+        var sb: StringBuilder = StringBuilder.new()
+        sb.append("# Server\r\n")
+        sb.append("nyx_kv_version:0.2.0\r\n")
+        sb.append("# Stats\r\n")
+        sb.append("total_commands_processed:" + int_to_string(g_ops_total) + "\r\n")
+        sb.append("# Keyspace\r\n")
+        sb.append("db0:keys=" + int_to_string(g_store.size()) + ",list_keys=" + int_to_string(g_lists.size()) + ",set_keys=" + int_to_string(g_sets.size()) + ",hash_keys=" + int_to_string(g_hashes.size()) + "\r\n")
+        return resp_bulk_string(sb.to_string())
+    }
+
+    // CONFIG (redis-benchmark sends CONFIG GET save at startup)
+    if name == "CONFIG" {
+        if g_public_mode == 1 { return is_command_disabled("CONFIG") }
+        return RESP_EMPTY_ARR
+    }
+
+    // COMMAND / COMMAND DOCS (redis-benchmark sends this)
+    if name == "COMMAND" {
+        return RESP_EMPTY_ARR
+    }
+
+    // CLIENT SETNAME/GETNAME/ID/... — handshake noise real Redis clients
+    // (redis-py included) send on connect. Task 6 (arco kv<->Redis): before
+    // this, CLIENT anything replied "unknown command" and some clients
+    // treat that as a hard connect failure. Minimum viable (documented,
+    // not a functional gap for the free-tier use case): the connection
+    // name from SETNAME is NOT persisted anywhere (no per-fd name table),
+    // so GETNAME always answers empty — matches a fresh connection that
+    // never called SETNAME. CLIENT ID returns the raw fd, which is unique
+    // and stable for the lifetime of the connection (good enough for a
+    // client-side sanity check; it does NOT match Redis's own internal
+    // client id numbering scheme, no client relies on that matching).
+    if name == "CLIENT" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'CLIENT' command")
+        }
+        // Gotcha: cmd[1].toUpper() inline (arr[i] sin bindear a local antes
+        // de llamar un método) no llega tipado — bindear primero.
+        let sub_raw: String = cmd[1]
+        let sub: String = sub_raw.toUpper()
+        if sub == "SETNAME" {
+            return RESP_OK
+        }
+        if sub == "GETNAME" {
+            return resp_bulk_string("")
+        }
+        if sub == "ID" {
+            return resp_integer(fd)
+        }
+        // INFO / LIST / NO-EVICT / other subcommands: reply OK instead of
+        // erroring so a client's handshake doesn't abort on us.
+        return RESP_OK
+    }
+
+    // HELLO — RESP3 protocol negotiation probe some newer client libraries
+    // send on connect (redis-py's protocol=3 path, and some auto-probe on
+    // first connect). nyxkv only speaks RESP2, so mimic what real Redis
+    // returns when a client asks for a protocol version the server refuses:
+    // -NOPROTO. Client libraries handle that by falling back to RESP2
+    // instead of treating it as a fatal error — which "unknown command"
+    // does NOT trigger, hence not reusing resp_error("unknown command...")
+    // here even though that's dispatch_command's generic fallback below.
+    if name == "HELLO" {
+        return "-NOPROTO unsupported protocol version\r\n"
+    }
+
+    // === List commands ===
+
+    // LPUSH key value [value ...]
+    if name == "LPUSH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'LPUSH' command")
+        }
+        let key: String = cmd[1]
+        var i: int = 2
+        var result: int = 0
+        while i < cmd.length() {
+            let value: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            result = kv_lpush(key, value)
+            if result == 0 - 1 { return RESP_WRONGTYPE }
+            i = i + 1
+        }
+        maybe_enforce_ttl(key, fd)
+        return resp_integer(result)
+    }
+
+    // RPUSH key value [value ...]
+    if name == "RPUSH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'RPUSH' command")
+        }
+        let key: String = cmd[1]
+        var i: int = 2
+        var result: int = 0
+        while i < cmd.length() {
+            let value: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            result = kv_rpush(key, value)
+            if result == 0 - 1 { return RESP_WRONGTYPE }
+            i = i + 1
+        }
+        maybe_enforce_ttl(key, fd)
+        return resp_integer(result)
+    }
+
+    // LPOP key
+    if name == "LPOP" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'LPOP' command")
+        }
+        let key: String = cmd[1]
+        let val: String = kv_lpop(key)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // RPOP key
+    if name == "RPOP" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'RPOP' command")
+        }
+        let key: String = cmd[1]
+        let val: String = kv_rpop(key)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // LLEN key
+    if name == "LLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'LLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_llen(key))
+    }
+
+    // LRANGE key start stop
+    if name == "LRANGE" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'LRANGE' command")
+        }
+        let key: String = cmd[1]
+        let start_str: String = cmd[2]
+        let stop_str: String = cmd[3]
+        if !is_int(start_str) or !is_int(stop_str) { return resp_error("value is not an integer or out of range") }
+        let start: int = string_to_int(start_str)
+        let stop: int = string_to_int(stop_str)
+        let result: Array = kv_lrange(key, start, stop)
+        return resp_bulk_array(result)
+    }
+
+    // LINDEX key index
+    if name == "LINDEX" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'LINDEX' command")
+        }
+        let key: String = cmd[1]
+        let idx_str: String = cmd[2]
+        if !is_int(idx_str) { return resp_error("value is not an integer or out of range") }
+        let idx: int = string_to_int(idx_str)
+        let val: String = kv_lindex(key, idx)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // TYPE key
+    if name == "TYPE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'TYPE' command")
+        }
+        let key: String = cmd[1]
+        return resp_simple_string(kv_type(key))
+    }
+
+    // === Additional string commands ===
+
+    // SETNX key value
+    if name == "SETNX" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SETNX' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+            let ip: String = get_client_ip(fd)
+            let kl: String = check_key_limit(ip, key)
+            if kl.length() > 0 { return kl }
+        }
+        let result: int = kv_setnx(key, value)
+        if result == 1 { maybe_enforce_ttl(key, fd) }
+        if result == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // SETEX key seconds value
+    if name == "SETEX" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'SETEX' command")
+        }
+        let key: String = cmd[1]
+        let sec_str: String = cmd[2]
+        let value: String = cmd[3]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+            let ip: String = get_client_ip(fd)
+            let kl: String = check_key_limit(ip, key)
+            if kl.length() > 0 { return kl }
+        }
+        if !is_int(sec_str) { return resp_error("value is not an integer or out of range") }
+        let expire_err: String = check_expire_num(sec_str, "EX", "setex")
+        if expire_err.length() > 0 { return expire_err }
+        var seconds: int = string_to_int(sec_str)
+        if g_public_mode == 1 { seconds = cap_ttl(seconds) }
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        kv_setex(key, seconds, value)
+        return RESP_OK
+    }
+
+    // APPEND key value
+    if name == "APPEND" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'APPEND' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_public_mode == 1 {
+            let vs: String = check_value_size(value)
+            if vs.length() > 0 { return vs }
+        }
+        let result: int = kv_append(key, value)
+        if result == 0 - 1 { return RESP_WRONGTYPE }
+        return resp_integer(result)
+    }
+
+    // STRLEN key
+    if name == "STRLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'STRLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_strlen(key))
+    }
+
+    // GETDEL key -> value (atomic get + del), nil if missing
+    if name == "GETDEL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'GETDEL' command")
+        }
+        let key: String = cmd[1]
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        if kv_exists(key) == 0 { return RESP_NULL }
+        let val: String = kv_get(key)
+        kv_del(key)
+        // GETDEL es UN comando pero compone kv_exists+kv_get+kv_del (cada
+        // uno suma 1 a g_ops_total) → compensar para que INFO
+        // total_commands_processed no infle 3x (follow-up (g) del review).
+        g_ops_total = g_ops_total - 2
+        return resp_bulk_string(val)
+    }
+
+    // GETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST] -> value, optionally
+    // adjusting the TTL (PERSIST removes it). No flags = plain GET (TTL
+    // untouched).
+    if name == "GETEX" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'GETEX' command")
+        }
+        let key: String = cmd[1]
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        if kv_exists(key) == 0 { return RESP_NULL }
+        let val: String = kv_get(key)
+        // Igual que GETDEL: kv_exists+kv_get suman 2 por UN comando (follow-up (g)).
+        g_ops_total = g_ops_total - 1
+        if cmd.length() > 2 {
+            let flag_raw: String = cmd[2]
+            let flag: String = flag_raw.toUpper()
+            if flag == "PERSIST" {
+                // Mismo cierre de política que el comando PERSIST (follow-up
+                // (c)): GETEX k PERSIST era el segundo camino del escape.
+                if g_public_mode == 1 and auth_force_ttl(fd) and !is_memory_key(key) {
+                    return resp_error("PERSIST disabled in free tier")
+                }
+                kv_persist(key)
+                // GETEX ya quedó contado como 1 arriba; kv_persist suma
+                // otro → compensar (follow-up (g)).
+                g_ops_total = g_ops_total - 1
+            } else if flag == "EX" or flag == "PX" or flag == "EXAT" or flag == "PXAT" {
+                if cmd.length() < 4 { return resp_error("ERR syntax error") }
+                let num_str: String = cmd[3]
+                if !is_int(num_str) { return resp_error("ERR value is not an integer or out of range") }
+                let expire_err: String = check_expire_num(num_str, flag, "getex")
+                if expire_err.length() > 0 { return expire_err }
+                let num: int = string_to_int(num_str)
+                let exp_us: int = ttl_flag_to_exp_us(flag, num)
+                kv_expire_at_us(key, exp_us)
+                // Ídem PERSIST: compensar el +1 de kv_expire_at_us.
+                g_ops_total = g_ops_total - 1
+            } else {
+                return resp_error("ERR syntax error")
+            }
+        }
+        return resp_bulk_string(val)
+    }
+
+    // GETSET key value
+    if name == "GETSET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'GETSET' command")
+        }
+        let key: String = cmd[1]
+        let value: String = cmd[2]
+        if g_lists.contains(key) or g_sets.contains(key) or g_hashes.contains(key) { return RESP_WRONGTYPE }
+        let old: String = kv_getset(key, value)
+        if old == "" { return RESP_NULL }
+        return resp_bulk_string(old)
+    }
+
+    // === Set commands ===
+
+    // SADD key member [member ...]
+    if name == "SADD" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SADD' command")
+        }
+        let key: String = cmd[1]
+        var added: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let member: String = cmd[i]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(member)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            let r: int = kv_sadd(key, member)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            added = added + r
+            i = i + 1
+        }
+        maybe_enforce_ttl(key, fd)
+        return resp_integer(added)
+    }
+
+    // SREM key member [member ...]
+    if name == "SREM" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SREM' command")
+        }
+        let key: String = cmd[1]
+        var removed: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let member: String = cmd[i]
+            let r: int = kv_srem(key, member)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            removed = removed + r
+            i = i + 1
+        }
+        return resp_integer(removed)
+    }
+
+    // SISMEMBER key member
+    if name == "SISMEMBER" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'SISMEMBER' command")
+        }
+        let key: String = cmd[1]
+        let member: String = cmd[2]
+        let r: int = kv_sismember(key, member)
+        if r == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // SMEMBERS key
+    if name == "SMEMBERS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SMEMBERS' command")
+        }
+        let key: String = cmd[1]
+        let members: Array = kv_smembers(key)
+        return resp_bulk_array(members)
+    }
+
+    // SCARD key
+    if name == "SCARD" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SCARD' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_scard(key))
+    }
+
+    // === Hash commands ===
+
+    // HSET key field value [field value ...]
+    if name == "HSET" {
+        if cmd.length() < 4 {
+            return resp_error("wrong number of arguments for 'HSET' command")
+        }
+        let key: String = cmd[1]
+        var new_fields: int = 0
+        var i: int = 2
+        while i + 1 < cmd.length() {
+            let field: String = cmd[i]
+            let value: String = cmd[i + 1]
+            if g_public_mode == 1 {
+                let vs: String = check_value_size(value)
+                if vs.length() > 0 { return vs }
+                if i == 2 {
+                    let ip: String = get_client_ip(fd)
+                    let kl: String = check_key_limit(ip, key)
+                    if kl.length() > 0 { return kl }
+                }
+            }
+            let r: int = kv_hset(key, field, value)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            new_fields = new_fields + r
+            i = i + 2
+        }
+        maybe_enforce_ttl(key, fd)
+        return resp_integer(new_fields)
+    }
+
+    // HGET key field
+    if name == "HGET" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HGET' command")
+        }
+        let key: String = cmd[1]
+        let field: String = cmd[2]
+        let val: String = kv_hget(key, field)
+        if val == "" { return RESP_NULL }
+        return resp_bulk_string(val)
+    }
+
+    // HDEL key field [field ...]
+    if name == "HDEL" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HDEL' command")
+        }
+        let key: String = cmd[1]
+        var removed: int = 0
+        var i: int = 2
+        while i < cmd.length() {
+            let field: String = cmd[i]
+            let r: int = kv_hdel(key, field)
+            if r == 0 - 1 { return RESP_WRONGTYPE }
+            removed = removed + r
+            i = i + 1
+        }
+        return resp_integer(removed)
+    }
+
+    // HGETALL key
+    if name == "HGETALL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HGETALL' command")
+        }
+        let key: String = cmd[1]
+        let pairs: Array = kv_hgetall(key)
+        return resp_bulk_array(pairs)
+    }
+
+    // HKEYS key
+    if name == "HKEYS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HKEYS' command")
+        }
+        let key: String = cmd[1]
+        let fields: Array = kv_hkeys(key)
+        return resp_bulk_array(fields)
+    }
+
+    // HVALS key
+    if name == "HVALS" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HVALS' command")
+        }
+        let key: String = cmd[1]
+        let vals: Array = kv_hvals(key)
+        return resp_bulk_array(vals)
+    }
+
+    // HEXISTS key field
+    if name == "HEXISTS" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'HEXISTS' command")
+        }
+        let key: String = cmd[1]
+        let field: String = cmd[2]
+        let r: int = kv_hexists(key, field)
+        if r == 1 { return RESP_ONE }
+        return RESP_ZERO
+    }
+
+    // HLEN key
+    if name == "HLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'HLEN' command")
+        }
+        let key: String = cmd[1]
+        return resp_integer(kv_hlen(key))
+    }
+
+    // SAVE — synchronous snapshot
+    if name == "SAVE" {
+        if g_public_mode == 1 {
+            return resp_error("command disabled in free tier")
+        }
+        let saved: int = kv_save(g_save_path)
+        print("[save] saved " + int_to_string(saved) + " keys to " + g_save_path)
+        return RESP_OK
+    }
+
+    // BGSAVE — trigger background save (same as SAVE in this implementation)
+    if name == "BGSAVE" {
+        if g_public_mode == 1 {
+            return resp_error("command disabled in free tier")
+        }
+        let saved: int = kv_save(g_save_path)
+        print("[bgsave] saved " + int_to_string(saved) + " keys to " + g_save_path)
+        return resp_simple_string("Background saving started")
+    }
+
+    // LASTSAVE — return timestamp of last save (seconds since epoch)
+    if name == "LASTSAVE" {
+        let ts: int = g_last_save_time / 1000000
+        return resp_integer(ts)
+    }
+
+    // === Pub/Sub commands ===
+
+    // SUBSCRIBE channel
+    if name == "SUBSCRIBE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'SUBSCRIBE' command")
+        }
+        let channel: String = cmd[1]
+        let resp: String = pubsub_subscribe(handle, is_tls, channel)
+        pubsub_write(handle, is_tls, resp)
+        // Signal worker to enter subscriber loop
+        return "__SUBSCRIBE__"
+    }
+
+    // PUBLISH channel message
+    if name == "PUBLISH" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'PUBLISH' command")
+        }
+        let channel: String = cmd[1]
+        let message: String = cmd[2]
+        let count: int = pubsub_publish(channel, message)
+        return resp_integer(count)
+    }
+
+    // UNSUBSCRIBE channel
+    if name == "UNSUBSCRIBE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'UNSUBSCRIBE' command")
+        }
+        let channel: String = cmd[1]
+        return pubsub_unsubscribe(handle, is_tls, channel)
+    }
+
+    return resp_error("unknown command '" + name + "'")
+}
+
+// === MULTI/EXEC/DISCARD — basic transactions (Task 6, arco kv<->Redis) ===
+//
+// dispatch_command above is STATELESS per-call (by design — see its doc
+// comment). Transaction state (are we inside MULTI? what's queued?) is
+// inherently per-CONNECTION, so it can't live there; it lives in the
+// worker's accept loop (daemon/src/main.nx kv_worker / kv_tls_worker) and
+// gets threaded through this helper on every command. WATCH/optimistic
+// locking is explicitly out of scope (P1) — this only gives you the
+// queue-then-run-atomically-against-the-single-writer-store semantics,
+// which is what redis-py's default pipeline(transaction=True) needs.
+
+// is_known_command_name: whitelist used ONLY to decide whether a command
+// queued inside MULTI should mark the transaction dirty (real Redis rejects
+// unknown commands at QUEUE time, not at EXEC time, and aborts the whole
+// EXEC with EXECABORT). This necessarily duplicates the set of verbs
+// dispatch_command actually handles — there is no introspection API to ask
+// dispatch_command "would you recognize this name" without executing it.
+// Documented drift risk (P1): a new command added to dispatch_command that
+// is NOT added here will queue fine (QUEUED) but never mark dirty even if
+// misspelled some other way; the only failure mode is a false "unknown
+// command" mark inside MULTI for a real command someone forgot to list
+// here, which EXECABORTs a transaction that should have run — annoying but
+// safe (no data corruption, no silent wrong behavior).
+fn is_known_command_name(name: String) -> bool {
+    if name == "PING" or name == "AUTH" or name == "WHOAMI" or name == "TOKEN_CREATE" or name == "TOKEN_REVOKE" or name == "TOKEN_LIST" {
+        return true
+    }
+    if name == "GET" or name == "SET" or name == "DEL" or name == "EXISTS" or name == "EXPIRE" or name == "TTL" or name == "PERSIST" or name == "INCR" or name == "DECR" or name == "INCRBY" or name == "DECRBY" or name == "TYPE" {
+        return true
+    }
+    if name == "SETNX" or name == "SETEX" or name == "APPEND" or name == "STRLEN" or name == "GETSET" or name == "GETDEL" or name == "GETEX" or name == "MSET" or name == "MGET" or name == "SCAN" or name == "KEYS" {
+        return true
+    }
+    if name == "DBSIZE" or name == "FLUSHDB" or name == "SAVE" or name == "BGSAVE" or name == "LASTSAVE" or name == "INFO" or name == "CONFIG" or name == "COMMAND" or name == "CLIENT" or name == "HELLO" {
+        return true
+    }
+    if name == "LPUSH" or name == "RPUSH" or name == "LPOP" or name == "RPOP" or name == "LLEN" or name == "LRANGE" or name == "LINDEX" {
+        return true
+    }
+    if name == "SADD" or name == "SREM" or name == "SISMEMBER" or name == "SMEMBERS" or name == "SCARD" {
+        return true
+    }
+    if name == "HSET" or name == "HGET" or name == "HDEL" or name == "HGETALL" or name == "HKEYS" or name == "HVALS" or name == "HEXISTS" or name == "HLEN" {
+        return true
+    }
+    if name == "SUBSCRIBE" or name == "PUBLISH" or name == "UNSUBSCRIBE" {
+        return true
+    }
+    if name == "MULTI" or name == "EXEC" or name == "DISCARD" {
+        return true
+    }
+    return false
+}
+
+// txn_dispatch: called by the worker loop BEFORE dispatch_command, once per
+// command, threading the per-connection transaction state through 3 holder
+// arrays (Nyx has no mutable-ref-to-scalar across a plain function call;
+// index-assignment on an Array IS visible to the caller because Array is a
+// reference type — same "1-element array as a mutable counter" idiom the
+// compiler itself uses, e.g. parser.nx lambda_counter/semantic.nx
+// id_counter):
+//   in_multi[0]: 0/1 — are we inside a MULTI right now.
+//   dirty[0]:    0/1 — did a QUEUE-time error happen (unknown command)?
+//                EXEC checks this and aborts instead of running the queue.
+//   queue_holder[0]: the actual queue, an Array of parsed cmd Arrays. Held
+//                one level of indirection deep (an Array holding ONE
+//                Array) so "clear the queue" can be an index-assignment
+//                (queue_holder[0] = []) instead of needing a .clear()
+//                method Array doesn't have.
+//
+// Returns either:
+//   - a fully-formed RESP response string that the worker should write
+//     as-is (MULTI/EXEC/DISCARD replies, +QUEUED, or a queue-time error), or
+//   - the sentinel "__TXN_PASS__" meaning "not a transaction concern, call
+//     dispatch_command(cmd, ...) normally" (mirrors the existing
+//     "__SUBSCRIBE__" sentinel convention already used by SUBSCRIBE).
+fn txn_dispatch(cmd: Array, in_multi: Array, dirty: Array, queue_holder: Array, fd: int, handle: int, is_tls: int) -> String {
+    let raw: String = cmd[0]
+    let name: String = raw.toUpper()
+
+    if name == "MULTI" {
+        if in_multi[0] == 1 {
+            return resp_error("MULTI calls can not be nested")
+        }
+        in_multi[0] = 1
+        dirty[0] = 0
+        queue_holder[0] = []
+        return RESP_OK
+    }
+
+    if name == "EXEC" {
+        if in_multi[0] == 0 {
+            return resp_error("EXEC without MULTI")
+        }
+        in_multi[0] = 0
+        let q: Array = queue_holder[0]
+        if dirty[0] == 1 {
+            dirty[0] = 0
+            queue_holder[0] = []
+            // NOT resp_error (which forces an "-ERR " prefix) — real Redis
+            // uses its own error code here and redis-py's pipeline code
+            // pattern-matches on "EXECABORT" specifically.
+            return "-EXECABORT Transaction discarded because of previous errors.\r\n"
+        }
+        var sb: StringBuilder = StringBuilder.new()
+        sb.append(resp_array_header(q.length()))
+        var i: int = 0
+        while i < q.length() {
+            // Gotcha (catalogado en el brief): arr[i] inline no llega
+            // tipado a algunos consumidores — bindear a local primero.
+            let qcmd: Array = q[i]
+            let r: String = dispatch_command(qcmd, fd, handle, is_tls)
+            sb.append(r)
+            i = i + 1
+        }
+        queue_holder[0] = []
+        return sb.to_string()
+    }
+
+    if name == "DISCARD" {
+        if in_multi[0] == 0 {
+            return resp_error("DISCARD without MULTI")
+        }
+        in_multi[0] = 0
+        dirty[0] = 0
+        queue_holder[0] = []
+        return RESP_OK
+    }
+
+    if in_multi[0] == 1 {
+        if is_known_command_name(name) == false {
+            dirty[0] = 1
+            return resp_error("unknown command '" + raw + "'")
+        }
+        // FIX (review final, Critical T2xT6): SUBSCRIBE/UNSUBSCRIBE (y las
+        // variantes pattern, aunque hoy no implementadas — is_known_command_name
+        // ya las rechaza como "unknown command" arriba) no pueden encolarse:
+        // dispatch_command para SUBSCRIBE escribe al socket + registra el
+        // subscriber FUERA del ciclo normal de EXEC, y el sentinel
+        // "__SUBSCRIBE__" se colaria literal en el array RESP del EXEC.
+        // Redis mismo rechaza esto en queue-time.
+        if name == "SUBSCRIBE" or name == "UNSUBSCRIBE" or name == "PSUBSCRIBE" or name == "PUNSUBSCRIBE" {
+            dirty[0] = 1
+            return resp_error("SUBSCRIBE is not allowed in transactions")
+        }
+        let q: Array = queue_holder[0]
+        // FIX (review final, Important, OOM remoto): el encolado de MULTI no
+        // pasa por check_rate_limit/check_value_size (esos corren en EXEC) —
+        // sin tope, un cliente puede acumular comandos sin límite antes de
+        // EXEC/DISCARD. Cap barato en cantidad de comandos encolados.
+        if q.length() >= 1024 {
+            dirty[0] = 1
+            return resp_error("transaction queue limit exceeded")
+        }
+        // Follow-up (a) del review kv↔Redis #1: el cap de CANTIDAD no frena
+        // ~120 SETs de 16MB encolados (= OOM en un host de 1.9GB antes del
+        // EXEC). Dos guards de BYTES en queue-time:
+        // 1) check_value_size por argumento (modo público — la misma
+        //    política que corre en EXEC, pero ANTES de retener el valor);
+        if g_public_mode == 1 {
+            var bi: int = 1
+            while bi < cmd.length() {
+                let barg: String = cmd[bi]
+                let bv: String = check_value_size(barg)
+                if bv.length() > 0 {
+                    dirty[0] = 1
+                    return bv
+                }
+                bi = bi + 1
+            }
+        }
+        // 2) cap TOTAL de bytes por transacción (incondicional, 8MB): suma
+        //    de los args ya encolados + el entrante. Recorrer la cola es
+        //    O(elementos) por queue-op (length() de String es O(1)) — con
+        //    el cap de 1024 comandos el peor caso es trivial.
+        var qbytes: int = 0
+        var qi: int = 0
+        while qi < q.length() {
+            let qc: Array = q[qi]
+            var qa: int = 0
+            while qa < qc.length() {
+                let qs: String = qc[qa]
+                qbytes = qbytes + qs.length()
+                qa = qa + 1
+            }
+            qi = qi + 1
+        }
+        var ci: int = 0
+        while ci < cmd.length() {
+            let cs: String = cmd[ci]
+            qbytes = qbytes + cs.length()
+            ci = ci + 1
+        }
+        if qbytes > 8388608 {
+            dirty[0] = 1
+            return resp_error("transaction queue bytes limit exceeded")
+        }
+        q.push(cmd)
+        return "+QUEUED\r\n"
+    }
+
+    return "__TXN_PASS__"
+}

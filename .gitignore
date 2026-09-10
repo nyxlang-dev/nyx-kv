@@ -1,0 +1,7 @@
+nyx-kv
+script.nx
+script.ll
+packages/
+*.o
+*.rdb
+.DS_Store
